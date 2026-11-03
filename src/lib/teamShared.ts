@@ -16,13 +16,21 @@ import { DAY_KEYS, type DayKey } from "@/lib/availability";
  * The only three banks members are paid into. Each member is allowed one or
  * more of them by a recruiter, and sees only those.
  */
-export const BANK_IDS = ["wise", "revolut", "n26"] as const;
+export const BANK_IDS = ["wise", "revolut", "n26", "vivid", "starling"] as const;
 export type BankId = (typeof BANK_IDS)[number];
 
-export const BANKS: Record<BankId, { label: string; signupUrl: string; defaultBic: string }> = {
+export const BANKS: Record<BankId, { label: string; signupUrl: string; defaultBic: string; bicHint?: string }> = {
   wise: { label: "Wise", signupUrl: "https://wise.com/register", defaultBic: "TRWIBEB1XXX" },
   revolut: { label: "Revolut", signupUrl: "https://www.revolut.com/", defaultBic: "REVOLT21XXX" },
   n26: { label: "N26", signupUrl: "https://n26.com/", defaultBic: "NTSBDEB1XXX" },
+  // Vivid gives each account its own IBAN and BIC, by country: nothing to fill in for them.
+  vivid: {
+    label: "Vivid",
+    signupUrl: "https://vivid.money/",
+    defaultBic: "",
+    bicHint: "Copy the BIC from your Vivid app: Account details. It depends on your account.",
+  },
+  starling: { label: "Starling Bank", signupUrl: "https://www.starlingbank.com/", defaultBic: "SRLGGB2LXXX" },
 };
 
 export function isBankId(v: unknown): v is BankId {
@@ -41,13 +49,15 @@ const N26_COUNTRIES = [
 const REVOLUT_ONLY_COUNTRIES = ["United Kingdom", "Switzerland"];
 
 /**
- * The banks ticked when a member is added, from where they live. N26 and
- * Revolut generally need a European address; Wise opens accounts in many more
- * countries. Only a starting point — the recruiter can change it.
+ * The banks ticked when a member is added, from where they live. N26, Vivid
+ * and Revolut generally need a European address, Starling a UK one; Wise opens
+ * accounts in many more countries. Only a starting point — the recruiter can
+ * change it.
  */
 export function defaultBanksFor(country: string | undefined): BankId[] {
   const c = (country ?? "").trim();
-  if (N26_COUNTRIES.includes(c)) return ["revolut", "n26"];
+  if (N26_COUNTRIES.includes(c)) return ["revolut", "n26", "vivid"];
+  if (c === "United Kingdom") return ["revolut", "starling"];
   if (REVOLUT_ONLY_COUNTRIES.includes(c)) return ["revolut"];
   return ["wise"];
 }
@@ -117,7 +127,7 @@ export function checkIban(raw: string): IbanCheck {
 }
 
 /**
- * Which of the three banks an IBAN belongs to, when it can be told from the
+ * Which of the banks an IBAN belongs to, when it can be told from the
  * IBAN alone. Each bank issues several kinds of IBAN, so "unknown" is common
  * and means nothing is wrong — it only drives a "please check" note.
  */
@@ -129,6 +139,7 @@ export function bankOfIban(iban: string): BankId | null {
   if (cc === "LT" && i.slice(4, 9) === "32500") return "revolut";
   if ((cc === "GB" || cc === "IE") && i.slice(4, 8) === "REVO") return "revolut";
   if (cc === "DE" && i.slice(4, 12) === "10011001") return "n26";
+  if (cc === "GB" && i.slice(4, 8) === "SRLG") return "starling";
   return null;
 }
 

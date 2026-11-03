@@ -4,6 +4,7 @@ import { useMemo, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { problemOf, teamPost } from "@/lib/teamClient";
 import { BANKS, bicFor, checkIban, formatIban, ibanBankWarning, type BankId } from "@/lib/teamShared";
+import { BankLogo } from "@/components/team/BankLogo";
 import { refreshAfterSave } from "@/lib/refreshAfterSave";
 
 /**
@@ -71,13 +72,23 @@ export function BankForm({ allowed, hasAccount }: { allowed: BankId[]; hasAccoun
           {allowed.map((b) => (
             <label
               key={b}
-              className={`flex cursor-pointer flex-col gap-1 rounded-2xl border p-4 transition ${
+              data-bank-choice={b}
+              className={`flex cursor-pointer flex-col gap-2 rounded-2xl border p-4 transition focus-within:ring-2 focus-within:ring-brand-300 ${
                 bank === b ? "border-brand-500 bg-brand-50 ring-2 ring-brand-200" : "border-cream-300 bg-white hover:border-brand-300"
               }`}
             >
-              <span className="flex items-center gap-2">
-                <input type="radio" name="bank" value={b} checked={bank === b} onChange={() => pickBank(b)} />
-                <span className="font-semibold text-navy-900">{BANKS[b].label}</span>
+              <span className="flex items-center gap-3">
+                <input type="radio" name="bank" value={b} checked={bank === b} onChange={() => pickBank(b)} className="sr-only" />
+                <BankLogo bank={b} size={44} />
+                <span className="min-w-0 flex-1 font-semibold text-navy-900">{BANKS[b].label}</span>
+                <span
+                  aria-hidden
+                  className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border-2 ${
+                    bank === b ? "border-brand-500 bg-brand-500" : "border-navy-200 bg-white"
+                  }`}
+                >
+                  {bank === b ? <span className="h-2 w-2 rounded-full bg-white" /> : null}
+                </span>
               </span>
               <a
                 href={BANKS[b].signupUrl}
@@ -148,7 +159,11 @@ export function BankForm({ allowed, hasAccount }: { allowed: BankId[]; hasAccoun
           autoComplete="off"
           spellCheck={false}
         />
-        <p className="mt-1.5 text-xs text-navy-400">Filled in for you. Change it only if your bank app shows a different one.</p>
+        <p className="mt-1.5 text-xs text-navy-400" data-bic-hint>
+          {bank && BANKS[bank].bicHint
+            ? BANKS[bank].bicHint
+            : "Filled in for you. Change it only if your bank app shows a different one."}
+        </p>
       </div>
 
       {error ? (

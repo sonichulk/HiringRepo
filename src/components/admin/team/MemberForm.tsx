@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { adminPost } from "@/lib/adminClient";
 import { DAY_KEYS, DAY_LABELS, START_TIMES, endTimeFor, knownTimeZones, type DayKey } from "@/lib/availability";
 import { BANK_IDS, BANKS, type BankId } from "@/lib/teamShared";
+import { BankLogo } from "@/components/team/BankLogo";
 import { refreshAfterSave } from "@/lib/refreshAfterSave";
 
 export interface MemberFormValues {
@@ -194,6 +195,7 @@ export function MemberForm({
                   set("allowedBanks", e.target.checked ? BANK_IDS.filter((x) => x === b || v.allowedBanks.includes(x)) : v.allowedBanks.filter((x) => x !== b))
                 }
               />
+              <BankLogo bank={b} size={22} className="!rounded-md" />
               {BANKS[b].label}
             </label>
           ))}

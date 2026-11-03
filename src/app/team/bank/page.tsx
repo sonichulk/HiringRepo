@@ -7,6 +7,7 @@ import { PortalShell } from "@/components/team/PortalShell";
 import { BankForm } from "@/components/team/BankForm";
 import { Section } from "@/components/team/ui";
 import { Icon } from "@/components/Icon";
+import { BankLogo } from "@/components/team/BankLogo";
 
 export const metadata: Metadata = { title: "Bank details" };
 
@@ -38,7 +39,10 @@ export default async function TeamBankPage() {
             <dl className="grid gap-3 text-sm sm:grid-cols-4" data-bank-current>
               <div>
                 <dt className="text-navy-400">Bank</dt>
-                <dd className="font-semibold text-navy-900">{current.bankLabel}</dd>
+                <dd className="flex items-center gap-2 font-semibold text-navy-900">
+                  <BankLogo bank={current.bank} size={28} className="!rounded-lg" />
+                  {current.bankLabel}
+                </dd>
               </div>
               <div>
                 <dt className="text-navy-400">Holder</dt>
@@ -58,7 +62,10 @@ export default async function TeamBankPage() {
 
         {pending ? (
           <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900" data-bank-pending>
-            <p className="font-semibold">Waiting for approval</p>
+            <p className="flex items-center gap-2 font-semibold">
+              <BankLogo bank={pending.bank} size={28} className="!rounded-lg" />
+              Waiting for approval
+            </p>
             <p className="mt-1">
               {pending.bankLabel} {pending.masked}, sent {formatDateTime(pending.submittedAt)}. We will email you once it is approved
               {current ? "; until then payments go to your current account" : ""}.
