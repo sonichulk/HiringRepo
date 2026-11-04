@@ -93,6 +93,7 @@ export type ChatReminderOutcome =
       chatLinkSentAt?: string;
       chatLinks?: string[];
       onboardingChatLinks?: string[];
+      followupChatLinks?: string[];
       link: string;
     }
   | { ok: false; reason: ChatReminderRefusal | string; refused?: boolean };
@@ -104,13 +105,14 @@ export async function sendChatReminder(
     kind: ReminderKind;
     by?: string;
     override?: boolean;
-    /** Which chat: the interview (default) or the onboarding chat. */
+    /** Which chat: the interview (default), the onboarding or the follow-up chat. */
     chat?: ChatKind;
   },
 ): Promise<ChatReminderOutcome> {
   const { kind } = opts;
-  const linkKind: ChatKind = opts.chat === "onboarding" ? "onboarding" : "interview";
+  const linkKind: ChatKind = opts.chat === "onboarding" || opts.chat === "followup" ? opts.chat : "interview";
   const onboarding = linkKind === "onboarding";
+  const followup = linkKind === "followup";
   const refuse = (reason: ChatReminderRefusal): ChatReminderOutcome => ({ ok: false, reason, refused: true });
 
   const candidate = await getCandidate(id);
@@ -140,7 +142,7 @@ export async function sendChatReminder(
   const linkSentAt = newLink ? now : current;
   let updated = candidate;
   if (newLink) {
-    const u = await recordChatLink(id, linkSentAt, linkKind);
+    const u = await recordChatLink(id, linkSentAt, linkKind, followup ? candidate.followupReasons?.[current] : undefined);
     if (!u) return refuse("not_found");
     updated = u;
   }
@@ -154,13 +156,13 @@ export async function sendChatReminder(
   let subject: string, html: string, text: string;
   if (kind === "nudge") {
     const settings = await getChatSettings();
-    const payload = { fullName, chatUrl, hours: settings.hours || undefined, validUntil: validUntil(linkSentAt), newLink, onboarding };
-    subject = chatReminderSubject(onboarding);
+    const payload = { fullName, chatUrl, hours: settings.hours || undefined, validUntil: validUntil(linkSentAt), newLink, onboarding, followup };
+    subject = chatReminderSubject(linkKind);
     html = chatReminderHtml(payload);
     text = chatReminderText(payload);
   } else {
-    const payload = { fullName, chatUrl, newLink, validDays: CHAT_LINK_TTL_DAYS, onboarding };
-    subject = chatLiveNowSubject(onboarding);
+    const payload = { fullName, chatUrl, newLink, validDays: CHAT_LINK_TTL_DAYS, onboarding, followup };
+    subject = chatLiveNowSubject(linkKind);
     html = chatLiveNowHtml(payload);
     text = chatLiveNowText(payload);
   }
@@ -197,6 +199,8 @@ export async function sendChatReminder(
     reminders: (updated.liveReminders ?? []).filter((r) => r.linkSentAt === linkSentAt),
     ...(onboarding
       ? { onboardingChatLinks: updated.onboardingChatLinks ?? [] }
+      : followup
+      ? { followupChatLinks: updated.followupChatLinks ?? [] }
       : { chatLinkSentAt: updated.chatLinkSentAt, chatLinks: updated.chatLinks }),
     link: chatLinkUrl(base, id, linkSentAt),
   };

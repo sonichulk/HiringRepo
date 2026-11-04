@@ -30,14 +30,81 @@ export type ChatSender = "candidate" | "recruiter" | "system";
  *   interview   the final interview, before the offer (the first kind)
  *   onboarding  after the signed agreement is accepted: the recruiter sends
  *               the team-portal login and walks the new member through it
+ *   followup    after the interview chat has ended: more questions, with the
+ *               reason written into the invitation and onto the chat page
  *
  * Kept on the candidate per link sent, and copied onto the conversation when
  * it starts, so an old conversation never changes kind.
  */
-export type ChatKind = "interview" | "onboarding";
+export type ChatKind = "interview" | "onboarding" | "followup";
+
+export const CHAT_KINDS: ChatKind[] = ["interview", "onboarding", "followup"];
 
 export function chatKindOf(s: { kind?: ChatKind }): ChatKind {
-  return s.kind === "onboarding" ? "onboarding" : "interview";
+  return s.kind === "onboarding" || s.kind === "followup" ? s.kind : "interview";
+}
+
+/** "final interview chat", "onboarding chat", "follow-up chat" — for sentences. */
+export const CHAT_NOUN: Record<ChatKind, string> = {
+  interview: "final interview chat",
+  onboarding: "onboarding chat",
+  followup: "follow-up chat",
+};
+
+/* -- Follow-up: where it stands, for the tables ---------------------------- */
+
+export type FollowupState = "sent" | "started" | "done";
+export type FollowupFilter = "all" | FollowupState | "none";
+
+export const FOLLOWUP_STATE_LABEL: Record<FollowupState, string> = {
+  sent: "Follow-up sent",
+  started: "Follow-up started",
+  done: "Follow-up done",
+};
+
+export const FOLLOWUP_FILTERS: { value: FollowupFilter; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "sent", label: "Sent – not started" },
+  { value: "started", label: "Started" },
+  { value: "done", label: "Done" },
+  { value: "none", label: "Not sent" },
+];
+
+/** The latest follow-up link, and the conversation it opened if any. */
+export function followupStateOf(
+  c: { id: string; followupChatLinks?: string[] },
+  sessions: { candidateId: string; linkSentAt: string; status: ChatStatus }[],
+): FollowupState | undefined {
+  const last = c.followupChatLinks?.at(-1);
+  if (!last) return undefined;
+  const s = sessions.find((x) => x.candidateId === c.id && x.linkSentAt === last);
+  return !s ? "sent" : s.status === "ended" ? "done" : "started";
+}
+
+export function matchesFollowupFilter(f: FollowupFilter, state: FollowupState | undefined): boolean {
+  if (f === "all") return true;
+  if (f === "none") return !state;
+  return state === f;
+}
+
+/* -- Follow-up: why we ask ------------------------------------------------- */
+
+export const MAX_FOLLOWUP_REASON = 400;
+
+/** The usual reasons, one click each; "custom" is written by the recruiter. */
+export const FOLLOWUP_REASONS: { value: string; label: string; message: string }[] = [
+  { value: "experience", label: "More about their experience", message: "We need a few more details about your experience." },
+  { value: "documents", label: "Questions about documents", message: "We have a few questions about the documents you sent us." },
+  { value: "availability", label: "Confirm availability", message: "We need to confirm your availability and working hours." },
+  { value: "details", label: "Check personal details", message: "We need to check some of the details you gave us." },
+  { value: "custom", label: "Write my own", message: "" },
+];
+
+/** The sentence the candidate reads, from a preset or the recruiter's own words. */
+export function followupReasonMessage(reason: string, custom: string): string {
+  const preset = FOLLOWUP_REASONS.find((r) => r.value === reason);
+  if (preset && preset.value !== "custom") return preset.message;
+  return cleanMessage(custom).replace(/\s+/g, " ").slice(0, MAX_FOLLOWUP_REASON);
 }
 
 export interface ChatMessage {
@@ -54,6 +121,8 @@ export interface ChatSession {
   candidateId: string;
   /** Absent on interview chats, which came first. */
   kind?: ChatKind;
+  /** Follow-up chats: why we asked, as the candidate was told. */
+  reason?: string;
   /** Which emailed link this conversation belongs to. */
   linkSentAt: string;
   /** Snapshots for the inbox, so the list does not need the candidate file. */
@@ -212,6 +281,8 @@ export interface ChatSettings {
   questions: string[];
   /** Ready-made portal explanations, for onboarding chats. */
   onboarding: OnboardingMessage[];
+  /** Saved questions for follow-up chats. */
+  followupQuestions: string[];
   /** Shown to candidates on the chat page. */
   hours: string;
   updatedAt?: string;
@@ -342,8 +413,26 @@ export function cleanOnboarding(raw: unknown): OnboardingMessage[] | { error: st
   return out;
 }
 
+/** A starting set for a follow-up chat. Editable in Settings → Live chat. */
+export const DEFAULT_FOLLOWUP_QUESTIONS: string[] = [
+  "Hi, thank you for joining again. We just need a little more information — it will only take a few minutes.",
+  "Could you tell us a bit more about your most recent job: the company, your role and how long you worked there?",
+  "Can you confirm the days and hours you are available to work each week?",
+  "Can you confirm your full address as it appears on your documents?",
+  "Is there anything that has changed since your interview (contact details, availability, location)?",
+  "Thank you, that is everything we needed. We will be in touch by email.",
+];
+
+function cleanQuestionList(raw: unknown, label: string): string[] | { error: string } {
+  if (!Array.isArray(raw)) return { error: `${label} must be a list` };
+  const list = raw.map((q) => cleanMessage(q)).filter((q) => q.length > 0);
+  if (list.length > MAX_QUESTIONS) return { error: `At most ${MAX_QUESTIONS} ${label}.` };
+  if (list.some((q) => q.length > MAX_QUESTION)) return { error: `Each question can be at most ${MAX_QUESTION} characters.` };
+  return list;
+}
+
 export function cleanSettings(raw: unknown): ChatSettings | { error: string } {
-  const r = (raw ?? {}) as { questions?: unknown; hours?: unknown; onboarding?: unknown };
+  const r = (raw ?? {}) as { questions?: unknown; hours?: unknown; onboarding?: unknown; followupQuestions?: unknown };
   if (!Array.isArray(r.questions)) return { error: "questions must be a list" };
   const questions = r.questions
     .map((q) => cleanMessage(q))
@@ -356,7 +445,10 @@ export function cleanSettings(raw: unknown): ChatSettings | { error: string } {
   if (hours.length > MAX_HOURS_TEXT) return { error: `The hours line can be at most ${MAX_HOURS_TEXT} characters.` };
   const onboarding = r.onboarding === undefined ? DEFAULT_ONBOARDING : cleanOnboarding(r.onboarding);
   if ("error" in onboarding) return onboarding;
-  return { questions, onboarding, hours };
+  const followupQuestions =
+    r.followupQuestions === undefined ? DEFAULT_FOLLOWUP_QUESTIONS : cleanQuestionList(r.followupQuestions, "follow-up questions");
+  if ("error" in followupQuestions) return followupQuestions;
+  return { questions, onboarding, followupQuestions, hours };
 }
 
 /* ------------------------------------------------------------------------ */
@@ -435,6 +527,8 @@ export interface AdminSessionView {
   reminders?: LiveReminder[];
   /** Onboarding chats: where they are with the team portal. */
   portal?: PortalState;
+  /** Follow-up chats: why we asked. */
+  reason?: string;
 }
 
 /**

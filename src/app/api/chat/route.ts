@@ -3,6 +3,7 @@ import { ACCESS_STATUS, forgetCandidateStatuses, resolveChatLink } from "@/lib/c
 import { appendMessage, presenceOf, setTyping, startSession, touchCandidate } from "@/lib/chatStore";
 import {
   MAX_MESSAGE,
+  chatKindOf,
   chatStatus,
   cleanMessage,
   isReminderId,
@@ -146,6 +147,7 @@ export async function POST(req: NextRequest) {
       ({ session, created } = await startSession({
         candidateId: candidate.id,
         kind: access.kind,
+        reason: access.kind === "followup" ? candidate.followupReasons?.[link.sentAt] : undefined,
         linkSentAt: link.sentAt,
         candidateName: name,
         candidateEmail: candidate.email || undefined,
@@ -162,8 +164,8 @@ export async function POST(req: NextRequest) {
           session.candidateName,
           candidate.email,
           session.candidateCountry,
-          `${base}/admin/chat?${session.kind === "onboarding" ? "tab=onboarding&" : ""}s=${session.id}`,
-          session.kind === "onboarding" ? "onboarding" : "interview",
+          `${base}/admin/chat?${session.kind && session.kind !== "interview" ? `tab=${session.kind}&` : ""}s=${session.id}`,
+          chatKindOf(session),
         ),
       ).catch(() => {});
     }
@@ -196,7 +198,7 @@ export async function POST(req: NextRequest) {
           name,
           candidate.email,
           candidate.confirmedDetails?.country || candidate.country || undefined,
-          `${base}/admin/chat?${access.kind === "onboarding" ? "tab=onboarding&" : ""}${s ? `s=${s.id}` : ""}`.replace(/[?&]$/, ""),
+          `${base}/admin/chat?${access.kind !== "interview" ? `tab=${access.kind}&` : ""}${s ? `s=${s.id}` : ""}`.replace(/[?&]$/, ""),
           !s ? "not_started" : chatStatus(s) === "active" ? "active" : "waiting",
           reminderKind(reminder),
         ),

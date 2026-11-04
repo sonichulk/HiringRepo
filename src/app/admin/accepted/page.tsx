@@ -5,6 +5,7 @@ import { listCandidates } from "@/lib/store";
 import { requiredCountries } from "@/lib/verificationStore";
 import { toCandidateView } from "@/lib/candidateView";
 import { listSessions } from "@/lib/chatStore";
+import { followupStateOf } from "@/lib/chat";
 import { AdminShell } from "@/components/admin/AdminShell";
 import { AcceptedTable } from "@/components/admin/AcceptedTable";
 import { listMembers } from "@/lib/teamStore";
@@ -43,6 +44,7 @@ export default async function AdminAcceptedPage() {
   const rows = accepted.map((c) => ({
     ...toCandidateView(c, base, required),
     chatStarted: !!c.chatLinkSentAt && started.has(`${c.id}|${c.chatLinkSentAt}`),
+    followupState: followupStateOf(c, sessions),
   }));
 
   return (

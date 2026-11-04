@@ -153,10 +153,14 @@ export function buildChatStartedMessage(
   email: string | undefined,
   country: string | undefined,
   adminUrl: string,
-  kind: "interview" | "onboarding" = "interview",
+  kind: "interview" | "onboarding" | "followup" = "interview",
 ): string {
   return [
-    kind === "onboarding" ? "💬 <b>Onboarding chat started</b>" : "💬 <b>Final interview chat started</b>",
+    kind === "onboarding"
+      ? "💬 <b>Onboarding chat started</b>"
+      : kind === "followup"
+        ? "💬 <b>Follow-up chat started</b>"
+        : "💬 <b>Final interview chat started</b>",
     "",
     ...whoLines(name, email, country),
     "",

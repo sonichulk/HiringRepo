@@ -61,6 +61,9 @@ import {
   onboardingChatHtml,
   onboardingChatSubject,
   onboardingChatText,
+  followupChatHtml,
+  followupChatSubject,
+  followupChatText,
   finalChatText,
   chatLiveNowHtml,
   chatLiveNowSubject,
@@ -513,6 +516,25 @@ export const EMAIL_CATALOGUE: readonly CatalogueEntry[] = [
         html: finalChatHtml(payload),
         text: finalChatText(payload),
       };
+    },
+  },
+  {
+    id: "followup-chat",
+    name: "Follow-up chat invitation",
+    stage: "voice",
+    when:
+      "Sent by hand with Invite to follow-up chat — in View info → Assessment, or in an ended interview chat in Live chat — once the interview chat has ended. Carries the reason you chose. The link is valid for 7 days; the chat appears in Live chat → Follow-up chat. The “we’re live” and reminder emails for it say “follow-up chat”.",
+    kind: "campaign",
+    source: "followupChatHtml",
+    render: () => {
+      const payload = {
+        fullName: SAMPLE_NAME,
+        chatUrl: link("/chat?t=EXAMPLE"),
+        reason: "We need a few more details about your experience.",
+        hours: DEFAULT_HOURS,
+        validDays: CHAT_LINK_TTL_DAYS,
+      };
+      return { subject: followupChatSubject(), html: followupChatHtml(payload), text: followupChatText(payload) };
     },
   },
   {

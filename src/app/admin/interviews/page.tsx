@@ -3,6 +3,8 @@ import Link from "next/link";
 import { headers } from "next/headers";
 import { requireAdmin } from "@/lib/adminAuth";
 import { listCandidates } from "@/lib/store";
+import { listSessions } from "@/lib/chatStore";
+import { followupStateOf } from "@/lib/chat";
 import { requiredCountries } from "@/lib/verificationStore";
 import { toCandidateView } from "@/lib/candidateView";
 import { notAskedYet, verificationStatus } from "@/lib/verification";
@@ -70,8 +72,9 @@ export default async function AdminInterviewsPage({
   const unasked = finished.filter(notAsked);
   const listed = onlyAsked ? finished.filter((c) => !notAsked(c)) : finished;
 
+  const sessions = await listSessions();
   const rows: InterviewRow[] = listed.map((c) => ({
-    view: toCandidateView(c, base, required),
+    view: { ...toCandidateView(c, base, required), followupState: followupStateOf(c, sessions) },
   }));
 
   return (

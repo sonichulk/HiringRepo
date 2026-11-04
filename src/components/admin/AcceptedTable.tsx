@@ -30,6 +30,8 @@ import type { CandidateView } from "@/lib/candidateView";
 import { ADDRESS_STATUS_LABEL, type AddressProofStatus } from "@/lib/addressProof";
 import { AGREEMENT_STATUS_LABEL, type AgreementStatus } from "@/lib/agreement";
 import { ID_TYPE_FILTERS, matchesIdTypeFilter, type IdTypeFilter } from "@/lib/identityDocuments";
+import { FOLLOWUP_FILTERS, matchesFollowupFilter, type FollowupFilter } from "@/lib/chat";
+import { FollowupTag } from "@/components/admin/FollowupTag";
 
 /** The proof-of-address tag's colour, by where it stands. */
 const ADDRESS_TAG: Record<AddressProofStatus, string> = {
@@ -118,6 +120,7 @@ export function AcceptedTable({
   const [addressProof, setAddressProof] = useState<"all" | AddressProofStatus>("all");
   const [agreement, setAgreement] = useState<"all" | AgreementStatus>("all");
   const [idType, setIdType] = useState<IdTypeFilter>("all");
+  const [followup, setFollowup] = useState<FollowupFilter>("all");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const tableTop = useRef<HTMLDivElement>(null);
@@ -175,9 +178,10 @@ export function AcceptedTable({
       if (addressProof !== "all" && (c.addressProofStatus ?? "not_asked") !== addressProof) return false;
       if (agreement !== "all" && (c.agreementStatus ?? "not_sent") !== agreement) return false;
       if (!matchesIdTypeFilter(idType, c.identityDocumentType)) return false;
+      if (!matchesFollowupFilter(followup, c.followupState)) return false;
       return true;
     });
-  }, [live, search, country, hiddenCountries, verified, engagedAs, gstin, chatSent, addressProof, agreement, idType]);
+  }, [live, search, country, hiddenCountries, verified, engagedAs, gstin, chatSent, addressProof, agreement, idType, followup]);
 
   /** How many each GSTIN choice would show, among the people not hidden by country. */
   const gstinCounts = useMemo(() => {
@@ -260,7 +264,7 @@ export function AcceptedTable({
 
   useEffect(() => {
     setPage(1);
-  }, [search, country, hiddenCountries.hidden, verified, engagedAs, gstin, chatSent, addressProof, agreement, idType, pageSize]);
+  }, [search, country, hiddenCountries.hidden, verified, engagedAs, gstin, chatSent, addressProof, agreement, idType, followup, pageSize]);
 
   function goToPage(next: number) {
     setPage(next);
@@ -315,6 +319,17 @@ export function AcceptedTable({
             <span className="label">ID document</span>
             <select id="idtype" className="select" value={idType} onChange={(e) => setIdType(e.target.value as IdTypeFilter)}>
               {ID_TYPE_FILTERS.map((f) => (
+                <option key={f.value} value={f.value}>
+                  {f.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="block">
+            <span className="label">Follow-up chat</span>
+            <select id="followup" className="select" value={followup} onChange={(e) => setFollowup(e.target.value as FollowupFilter)}>
+              {FOLLOWUP_FILTERS.map((f) => (
                 <option key={f.value} value={f.value}>
                   {f.label}
                 </option>
@@ -669,6 +684,13 @@ export function AcceptedTable({
                           Address {ADDRESS_STATUS_LABEL[c.addressProofStatus].toLowerCase()}
                         </button>
                       ) : null}
+                      <FollowupTag
+                        state={c.followupState}
+                        onOpen={() => {
+                          openProfileOn("assessment");
+                          openProfile(c);
+                        }}
+                      />
                       {c.agreementStatus && c.agreementStatus !== "not_sent" ? (
                         <span
                           data-agreement-tag={c.agreementStatus}

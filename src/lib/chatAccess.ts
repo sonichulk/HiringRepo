@@ -83,15 +83,23 @@ export async function resolveChatLink(
 
 /** The newest link of one kind — the one that may start a chat. */
 export function currentChatLink(
-  c: Pick<Candidate, "chatLinkSentAt" | "onboardingChatLinks">,
+  c: Pick<Candidate, "chatLinkSentAt" | "onboardingChatLinks" | "followupChatLinks">,
   kind: ChatKind,
 ): string | undefined {
-  return kind === "onboarding" ? c.onboardingChatLinks?.at(-1) : c.chatLinkSentAt;
+  if (kind === "onboarding") return c.onboardingChatLinks?.at(-1);
+  if (kind === "followup") return c.followupChatLinks?.at(-1);
+  return c.chatLinkSentAt;
 }
 
 /** What a chat link was sent for — a conversation already open keeps its own. */
-export function chatLinkKind(c: Pick<Candidate, "onboardingChatLinks">, sentAt: string | undefined): ChatKind {
-  return sentAt && c.onboardingChatLinks?.includes(sentAt) ? "onboarding" : "interview";
+export function chatLinkKind(
+  c: Pick<Candidate, "onboardingChatLinks" | "followupChatLinks">,
+  sentAt: string | undefined,
+): ChatKind {
+  if (!sentAt) return "interview";
+  if (c.onboardingChatLinks?.includes(sentAt)) return "onboarding";
+  if (c.followupChatLinks?.includes(sentAt)) return "followup";
+  return "interview";
 }
 
 export const ACCESS_STATUS: Record<Exclude<ChatAccess, { ok: true }>["reason"], number> = {

@@ -26,12 +26,16 @@ export default async function AdminChatPage({
       <header className="mb-4">
         <h1 className="text-2xl font-bold text-navy-900 sm:text-3xl">Live chat</h1>
         <p className="mt-1 text-sm text-navy-500">
-          Interview chats and onboarding chats, each in its own tab. Candidates appear when they
+          Interview, onboarding and follow-up chats, each in its own tab. Candidates appear when they
           press Start chat on the link you sent them — you also get a Telegram message.
         </p>
       </header>
-      <LiveChatInbox questions={settings.questions} onboarding={settings.onboarding} initialId={typeof s === "string" ? s : undefined}
-        initialTab={sp.tab === "onboarding" ? "onboarding" : "interview"}
+      <LiveChatInbox
+        questions={settings.questions}
+        onboarding={settings.onboarding}
+        followupQuestions={settings.followupQuestions}
+        initialId={typeof s === "string" ? s : undefined}
+        initialTab={sp.tab === "onboarding" || sp.tab === "followup" ? sp.tab : "interview"}
       />
     </AdminShell>
   );

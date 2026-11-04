@@ -29,6 +29,7 @@ import path from "node:path";
 import { writeFileAtomic } from "@/lib/atomicWrite";
 import { newId } from "@/lib/id";
 import {
+  DEFAULT_FOLLOWUP_QUESTIONS,
   DEFAULT_HOURS,
   DEFAULT_ONBOARDING,
   DEFAULT_QUESTIONS,
@@ -451,6 +452,8 @@ function mutate<T>(
 export function startSession(input: {
   candidateId: string;
   kind?: ChatKind;
+  /** Follow-up chats: why we asked. */
+  reason?: string;
   linkSentAt: string;
   candidateName: string;
   candidateEmail?: string;
@@ -466,11 +469,12 @@ export function startSession(input: {
         }
       }
       const now = new Date().toISOString();
-      const { kind, ...rest } = input;
+      const { kind, reason, ...rest } = input;
       const session: ChatSession = {
         id: newId(12),
         ...rest,
-        ...(kind === "onboarding" ? { kind } : {}),
+        ...(kind === "onboarding" || kind === "followup" ? { kind } : {}),
+        ...(kind === "followup" && reason ? { reason } : {}),
         startedAt: now,
         messages: [
           message(
@@ -642,12 +646,15 @@ export async function getChatSettings(): Promise<ChatSettings & { isDefault: boo
   try {
     raw = await fs.readFile(settingsFile(), "utf8");
   } catch {
-    return { questions: DEFAULT_QUESTIONS, onboarding: DEFAULT_ONBOARDING, hours: DEFAULT_HOURS, isDefault: true };
+    return { questions: DEFAULT_QUESTIONS, onboarding: DEFAULT_ONBOARDING, followupQuestions: DEFAULT_FOLLOWUP_QUESTIONS, hours: DEFAULT_HOURS, isDefault: true };
   }
   try {
     const s = JSON.parse(raw) as Partial<ChatSettings>;
     return {
       questions: Array.isArray(s.questions) ? s.questions.filter((q): q is string => typeof q === "string") : DEFAULT_QUESTIONS,
+      followupQuestions: Array.isArray(s.followupQuestions)
+        ? s.followupQuestions.filter((q): q is string => typeof q === "string")
+        : DEFAULT_FOLLOWUP_QUESTIONS,
       // Settings saved before onboarding chats existed have none: the defaults.
       onboarding: Array.isArray(s.onboarding)
         ? s.onboarding.filter((m): m is { title: string; text: string } => !!m && typeof m.title === "string" && typeof m.text === "string")
@@ -659,12 +666,12 @@ export async function getChatSettings(): Promise<ChatSettings & { isDefault: boo
   } catch {
     // eslint-disable-next-line no-console
     console.error("[chat] chat-settings.json could not be parsed; showing the defaults");
-    return { questions: DEFAULT_QUESTIONS, onboarding: DEFAULT_ONBOARDING, hours: DEFAULT_HOURS, isDefault: true };
+    return { questions: DEFAULT_QUESTIONS, onboarding: DEFAULT_ONBOARDING, followupQuestions: DEFAULT_FOLLOWUP_QUESTIONS, hours: DEFAULT_HOURS, isDefault: true };
   }
 }
 
 /** Replaces the settings whole — there is nothing in the old file to keep. */
-export function saveChatSettings(next: Pick<ChatSettings, "questions" | "onboarding" | "hours">): Promise<ChatSettings> {
+export function saveChatSettings(next: Pick<ChatSettings, "questions" | "onboarding" | "followupQuestions" | "hours">): Promise<ChatSettings> {
   return ready().then(() =>
     serial(async () => {
       const saved: ChatSettings = { ...next, updatedAt: new Date().toISOString() };

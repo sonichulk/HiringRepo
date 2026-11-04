@@ -86,6 +86,7 @@ function view(s: ChatSession, from: number, { candidateStatus, reminders, portal
     candidateStatus,
     reminders,
     ...(portal ? { portal } : {}),
+    ...(s.reason ? { reason: s.reason } : {}),
   };
 }
 

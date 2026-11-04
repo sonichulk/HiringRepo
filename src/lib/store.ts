@@ -482,6 +482,10 @@ export interface Candidate {
    * the live one. See lib/chat ChatKind.
    */
   onboardingChatLinks?: string[];
+  /** Follow-up chat links, oldest first — a third chain, like onboarding's. */
+  followupChatLinks?: string[];
+  /** Why each follow-up was asked, by the link's send time. */
+  followupReasons?: Record<string, string>;
   /** "Our team is live now" emails, oldest first — see lib/chat. */
   liveReminders?: LiveReminder[];
   /** When the status was set to "Full verified", and by whom. Cleared if it is changed away. */
@@ -1497,12 +1501,22 @@ export function clearResidenceImages(id: string): Promise<string[]> {
  * A chat link was emailed — for the final interview, or for onboarding. The
  * newest of its kind replaces the one before; the other kind is not touched.
  */
-export function recordChatLink(id: string, sentAt: string, kind: "interview" | "onboarding" = "interview"): Promise<Candidate | null> {
+export function recordChatLink(
+  id: string,
+  sentAt: string,
+  kind: "interview" | "onboarding" | "followup" = "interview",
+  reason?: string,
+): Promise<Candidate | null> {
   return withWrite((list) => {
     const c = list.find((x) => x.id === id);
     if (!c) return { list, result: null };
     if (kind === "onboarding") {
       c.onboardingChatLinks = [...(c.onboardingChatLinks ?? []), sentAt];
+      return { list, result: c };
+    }
+    if (kind === "followup") {
+      c.followupChatLinks = [...(c.followupChatLinks ?? []), sentAt];
+      if (reason) c.followupReasons = { ...(c.followupReasons ?? {}), [sentAt]: reason };
       return { list, result: c };
     }
     c.chatLinks = [...(c.chatLinks ?? []), sentAt];
@@ -1839,9 +1853,23 @@ export function setGstinByRecruiter(id: string, gstin: string, by?: string): Pro
  * Undo a chat link whose email never left, so the previous link keeps working.
  * Only when it is still the newest — a later send is not touched.
  */
-export function revertChatLink(id: string, sentAt: string, kind: "interview" | "onboarding" = "interview"): Promise<boolean> {
+export function revertChatLink(
+  id: string,
+  sentAt: string,
+  kind: "interview" | "onboarding" | "followup" = "interview",
+): Promise<boolean> {
   return withWrite((list) => {
     const c = list.find((x) => x.id === id);
+    if (kind === "followup") {
+      if (!c || c.followupChatLinks?.at(-1) !== sentAt) return { list, result: false };
+      c.followupChatLinks = (c.followupChatLinks ?? []).slice(0, -1);
+      if (c.followupReasons?.[sentAt]) {
+        const { [sentAt]: _gone, ...rest } = c.followupReasons;
+        void _gone;
+        c.followupReasons = rest;
+      }
+      return { list, result: true };
+    }
     if (kind === "onboarding") {
       if (!c || c.onboardingChatLinks?.at(-1) !== sentAt) return { list, result: false };
       c.onboardingChatLinks = (c.onboardingChatLinks ?? []).slice(0, -1);

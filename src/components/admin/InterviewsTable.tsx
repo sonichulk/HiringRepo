@@ -14,7 +14,9 @@ import { CandidateInfoButton } from "@/components/admin/CandidateInfoButton";
 import { DeleteCandidateButton } from "@/components/admin/DeleteCandidateButton";
 import { RefreshButton } from "@/components/admin/RefreshButton";
 import { Icon } from "@/components/Icon";
-import { CandidateProfileModal } from "@/components/admin/CandidateProfileModal";
+import { CandidateProfileModal, openProfileOn } from "@/components/admin/CandidateProfileModal";
+import { FOLLOWUP_FILTERS, matchesFollowupFilter, type FollowupFilter } from "@/lib/chat";
+import { FollowupTag } from "@/components/admin/FollowupTag";
 import { DocumentViewer } from "@/components/admin/DocumentViewer";
 import { useProfileNav } from "@/components/admin/useProfileNav";
 import { useBulkCompanyCheck } from "@/components/admin/BulkCompanyCheck";
@@ -100,6 +102,7 @@ export function InterviewsTable({ rows }: { rows: InterviewRow[] }) {
   const [verification, setVerification] = useState<VerificationFilter>("all");
   const [status, setStatus] = useState<"all" | CandidateStatus>("all");
   const [offer, setOffer] = useState<"all" | OfferStatus>("all");
+  const [followup, setFollowup] = useState<FollowupFilter>("all");
   /**
    * When the interview was completed.
    *
@@ -238,6 +241,7 @@ export function InterviewsTable({ rows }: { rows: InterviewRow[] }) {
       }
       if (status !== "all" && c.status !== status) return false;
       if (offer !== "all" && offerStatus(c) !== offer) return false;
+      if (!matchesFollowupFilter(followup, c.followupState)) return false;
       // No completion date at all means the interview happened somewhere else
       // and somebody set the status by hand. There is no day to match, so any
       // dated question excludes them rather than guessing one.
@@ -248,7 +252,7 @@ export function InterviewsTable({ rows }: { rows: InterviewRow[] }) {
       }
       return true;
     });
-  }, [live, search, country, hiddenCountries, voice, verification, status, offer, range]);
+  }, [live, search, country, hiddenCountries, voice, verification, status, offer, range, followup]);
 
   /** How many rows the hidden countries are keeping off the table. */
   const hiddenCount = useMemo(
@@ -396,7 +400,7 @@ export function InterviewsTable({ rows }: { rows: InterviewRow[] }) {
 
   useEffect(() => {
     setPage(1);
-  }, [search, country, hiddenCountries.hidden, voice, verification, status, offer, range, pageSize]);
+  }, [search, country, hiddenCountries.hidden, voice, verification, status, offer, range, followup, pageSize]);
 
   function goToPage(next: number) {
     setPage(next);
@@ -502,6 +506,17 @@ export function InterviewsTable({ rows }: { rows: InterviewRow[] }) {
             >
               {VERIFICATION_FILTERS.map((f) => (
                 <option key={f.value} value={f.value}>{f.label}</option>
+              ))}
+            </select>
+          </label>
+
+          <label className="block">
+            <span className="label">Follow-up chat</span>
+            <select id="followup" className="select" value={followup} onChange={(e) => setFollowup(e.target.value as FollowupFilter)}>
+              {FOLLOWUP_FILTERS.map((f) => (
+                <option key={f.value} value={f.value}>
+                  {f.label}
+                </option>
               ))}
             </select>
           </label>
@@ -722,11 +737,20 @@ export function InterviewsTable({ rows }: { rows: InterviewRow[] }) {
                       <StatusBadge status={c.status} />
                     </td>
                     <td className="px-4 py-3">
-                      <VerificationBadge
-                        status={c.verificationStatus}
-                        requestedAt={c.verificationRequestedAt}
-                        onOpenPhotos={() => setQuickView(c)}
-                      />
+                      <div className="flex flex-col items-start gap-1">
+                        <VerificationBadge
+                          status={c.verificationStatus}
+                          requestedAt={c.verificationRequestedAt}
+                          onOpenPhotos={() => setQuickView(c)}
+                        />
+                        <FollowupTag
+                          state={c.followupState}
+                          onOpen={() => {
+                            openProfileOn("assessment");
+                            openProfile(c);
+                          }}
+                        />
+                      </div>
                     </td>
                     {/* Bounded, because the Results column is sticky and floats
                         over whatever runs under it. Without a width the voice

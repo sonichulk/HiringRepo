@@ -10,6 +10,7 @@ import { ChatMessages } from "@/components/admin/chat/ChatMessages";
 import { LiveNowButton } from "@/components/admin/chat/LiveNowButton";
 import { ChatProfilePopup } from "@/components/admin/chat/ChatProfilePopup";
 import { PortalLoginButton } from "@/components/admin/chat/PortalLoginButton";
+import { FollowupInviteDialog } from "@/components/admin/chat/FollowupInviteDialog";
 import {
   MAX_MESSAGE,
   fillOnboarding,
@@ -91,24 +92,31 @@ function beep() {
 }
 
 /** The two kinds of chat, each in its own tab. */
-const TABS: { kind: ChatKind; label: string; icon: "headset" | "usersGroup" }[] = [
+const TABS: { kind: ChatKind; label: string; icon: "headset" | "usersGroup" | "chatDots" }[] = [
   { kind: "interview", label: "Interview chat", icon: "headset" },
   { kind: "onboarding", label: "Onboarding chat", icon: "usersGroup" },
+  { kind: "followup", label: "Follow-up chat", icon: "chatDots" },
 ];
 
 export function LiveChatInbox({
   questions,
   onboarding = [],
+  followupQuestions = [],
   initialId,
   initialTab = "interview",
 }: {
   questions: string[];
+  /** Saved questions for follow-up chats. */
+  followupQuestions?: string[];
   /** Ready-made portal explanations, for onboarding chats. */
   onboarding?: OnboardingMessage[];
   initialId?: string;
   initialTab?: ChatKind;
 }) {
   const [tab, setTab] = useState<ChatKind>(initialTab);
+  /** "Invite to follow-up chat", from an ended interview. */
+  const [followupFor, setFollowupFor] = useState(false);
+  const [notice, setNotice] = useState("");
   const tabSynced = useRef(!initialId);
   const [list, setList] = useState<ChatSummary[] | null>(null);
   const [health, setHealth] = useState<Health>("ok");
@@ -265,7 +273,7 @@ export function LiveChatInbox({
       : undefined;
     setSelected(first?.id);
     try {
-      window.history.replaceState(null, "", k === "onboarding" ? "/admin/chat?tab=onboarding" : "/admin/chat");
+      window.history.replaceState(null, "", k === "interview" ? "/admin/chat" : `/admin/chat?tab=${k}`);
     } catch {
       /* the address just does not follow */
     }
@@ -440,6 +448,7 @@ export function LiveChatInbox({
   }, [draft, open?.id]);
 
   const isOnboarding = open?.kind === "onboarding";
+  const activeQuestions = open?.kind === "followup" ? followupQuestions : questions;
   /** The ready-made portal messages for the open chat, filled in for this person. */
   const portalMessages = useMemo(() => {
     if (!open || open.kind !== "onboarding") return [];
@@ -459,7 +468,7 @@ export function LiveChatInbox({
   }, [open?.messages]);
 
   const attention = useMemo(() => {
-    const n: Record<ChatKind, number> = { interview: 0, onboarding: 0 };
+    const n: Record<ChatKind, number> = { interview: 0, onboarding: 0, followup: 0 };
     for (const s of list ?? []) if (needsAttention(s)) n[s.kind] += 1;
     return n;
   }, [list]);
@@ -551,12 +560,14 @@ export function LiveChatInbox({
               <p className="p-4 text-sm text-navy-500">{health === "ok" ? "Loading…" : "Could not load chats — retrying…"}</p>
             ) : tabEmpty ? (
               <div className="p-6 text-center" data-chat-empty={tab}>
-                <Icon name={tab === "onboarding" ? "usersGroup" : "headset"} className="mx-auto h-8 w-8 text-navy-300" />
+                <Icon name={TABS.find((t) => t.kind === tab)?.icon ?? "headset"} className="mx-auto h-8 w-8 text-navy-300" />
                 <p className="mt-2 text-sm font-semibold text-navy-700">
-                  {tab === "onboarding" ? "No onboarding chats yet" : "No interview chats yet"}
+                  {tab === "onboarding" ? "No onboarding chats yet" : tab === "followup" ? "No follow-up chats yet" : "No interview chats yet"}
                 </p>
                 <p className="mt-1 text-xs text-navy-500">
-                  {tab === "onboarding"
+                  {tab === "followup"
+                    ? "When an interview chat has ended, press Invite to follow-up chat — in that chat here, or in View info → Assessment. When they press Start chat, they appear here and you get a Telegram message."
+                    : tab === "onboarding"
                     ? "Accept a signed agreement, then press Invite to onboarding chat in View info → Agreement. When they press Start chat, they appear here and you get a Telegram message."
                     : "Send a final interview chat link from a candidate’s View info. When they press Start chat, they appear here and you get a Telegram message."}
                 </p>
@@ -703,6 +714,10 @@ export function LiveChatInbox({
                       <span className="mt-0.5 inline-flex rounded-full bg-brand-500 px-2 py-px text-[10px] font-bold uppercase tracking-wide text-navy-900">
                         Onboarding chat
                       </span>
+                    ) : view.kind === "followup" ? (
+                      <span className="mt-0.5 inline-flex rounded-full bg-navy-900 px-2 py-px text-[10px] font-bold uppercase tracking-wide text-brand-300">
+                        Follow-up chat
+                      </span>
                     ) : null}
                     <p className="truncate text-xs text-navy-500">
                       {view.status === "ended" ? (
@@ -768,6 +783,21 @@ export function LiveChatInbox({
                       <span className="rounded-full bg-navy-100 px-3 py-1 text-[11px] font-bold text-navy-600">
                         {view.endedReason === "replaced" ? "Closed — new link sent" : "Ended"}
                       </span>
+                      {/* After the interview: chat with them again, with a reason. */}
+                      {view.kind === "interview" && view.endedReason !== "replaced" ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setNotice("");
+                            setFollowupFor(true);
+                          }}
+                          disabled={!view.candidateEmail?.includes("@")}
+                          data-followup-invite
+                          className="inline-flex items-center gap-1 rounded-full bg-brand-500 px-3 py-1 text-[11px] font-bold text-navy-900 transition hover:bg-brand-400 disabled:opacity-50"
+                        >
+                          <Icon name="send" className="h-3.5 w-3.5" /> Invite to follow-up chat
+                        </button>
+                      ) : null}
                       {/* The outcome, set in the same place the interview was
                           held. Once set it is a label, not a button: changing
                           it back is done from the status in View info. */}
@@ -796,6 +826,16 @@ export function LiveChatInbox({
 
               {actionError ? (
                 <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs font-medium text-amber-800">{actionError}</p>
+              ) : null}
+              {notice ? (
+                <p role="status" className="border-b border-green-200 bg-green-50 px-4 py-2 text-xs font-semibold text-green-800" data-followup-result="ok">
+                  {notice}
+                </p>
+              ) : null}
+              {view.kind === "followup" && view.reason ? (
+                <p className="border-b border-brand-200 bg-brand-50 px-4 py-1.5 text-[11px] font-medium text-navy-700" data-chat-reason>
+                  <strong>Why we asked:</strong> {view.reason}
+                </p>
               ) : null}
 
               {view.kind === "onboarding" && view.portal ? (
@@ -957,7 +997,7 @@ export function LiveChatInbox({
                     </div>
                   ) : showQuestions ? (
                     <div className="max-h-56 overflow-y-auto border-b border-navy-100 bg-navy-50/50 p-2" data-saved-questions>
-                      {questions.length === 0 ? (
+                      {activeQuestions.length === 0 ? (
                         <p className="p-2 text-xs text-navy-500">
                           No saved questions. Add some in{" "}
                           <Link href="/admin/settings/chat" className="font-semibold text-brand-700 underline">
@@ -966,7 +1006,7 @@ export function LiveChatInbox({
                           .
                         </p>
                       ) : (
-                        questions.map((q, i) => (
+                        activeQuestions.map((q, i) => (
                           <button
                             key={`${i}-${q.slice(0, 24)}`}
                             type="button"
@@ -1070,6 +1110,17 @@ export function LiveChatInbox({
           </>
         }
       />
+
+      {view ? (
+        <FollowupInviteDialog
+          open={followupFor}
+          candidateId={view.candidateId}
+          candidateName={view.candidateName}
+          email={view.candidateEmail}
+          onClose={() => setFollowupFor(false)}
+          onSent={() => setNotice("Follow-up invitation sent. They appear in the Follow-up chat tab when they press Start chat.")}
+        />
+      ) : null}
 
       <ConfirmDialog
         open={confirmEnd}

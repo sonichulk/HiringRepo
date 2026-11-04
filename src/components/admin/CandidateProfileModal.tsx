@@ -28,6 +28,7 @@ import { ConfirmedDetailsPanel } from "@/components/admin/ConfirmedDetailsPanel"
 import { CompanyDetailsPanel } from "@/components/admin/CompanyDetailsPanel";
 import { PanCardPanel } from "@/components/admin/PanCardPanel";
 import { ChatLinkPanel } from "@/components/admin/chat/ChatLinkPanel";
+import { FollowupChatPanel } from "@/components/admin/chat/FollowupChatPanel";
 import { VoicePanel } from "@/components/admin/VoicePanel";
 import { VoiceAckButton } from "@/components/admin/VoiceAckButton";
 import { VerifiedAckButton } from "@/components/admin/VerifiedAckButton";
@@ -573,6 +574,17 @@ export function CandidateProfileModal({
               email: candidate.email,
               chatLinkSentAt: candidate.chatLinkSentAt,
               chatLinks: candidate.chatLinks,
+            }}
+            onChange={(patch) => onChange(patch)}
+          />
+
+          {/* After the interview chat has ended: chat with them again. */}
+          <FollowupChatPanel
+            candidate={{
+              id: candidate.id,
+              fullName: candidate.fullName,
+              email: candidate.email,
+              followupChatLinks: candidate.followupChatLinks,
             }}
             onChange={(patch) => onChange(patch)}
           />

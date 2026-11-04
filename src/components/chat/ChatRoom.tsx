@@ -111,6 +111,7 @@ export function ChatRoom({
   position,
   hours,
   kind = "interview",
+  reason,
   initial,
   reminder,
 }: {
@@ -120,13 +121,17 @@ export function ChatRoom({
   hours: string;
   /** An onboarding chat, after the agreement: different words, same chat. */
   kind?: ChatKind;
+  /** A follow-up chat: why we asked, shown before they start. */
+  reason?: string;
   initial: CandidateChatState;
   /** Opened from a "we're live" email: tell the recruiter, once. */
   reminder?: string;
 }) {
   const hydrated = useHydrated();
   const onboarding = kind === "onboarding";
+  const followup = kind === "followup";
   const teamName = onboarding ? "WorkRoute Team" : RECRUITER_NAME;
+  const label = onboarding ? "Onboarding" : followup ? "Follow-up" : "Final interview";
   const [status, setStatus] = useState<CandidateChatState["status"]>(initial.status);
   const [messages, setMessages] = useState<PublicMessage[]>(initial.messages);
   const [pending, setPending] = useState<Pending[]>([]);
@@ -481,7 +486,7 @@ export function ChatRoom({
   /* -- the link stopped working ------------------------------------------ */
   if (blocked) {
     return (
-      <Frame name={teamName} label={onboarding ? "Onboarding" : "Final interview"} status="ended" statusLabel="Chat unavailable">
+      <Frame name={teamName} label={label} status="ended" statusLabel="Chat unavailable">
         <div className="flex flex-1 items-center justify-center p-6">
           <div className="max-w-md rounded-3xl border border-navy-100 bg-white p-8 text-center shadow-sm">
             <span className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-navy-100 text-navy-600">
@@ -508,17 +513,21 @@ export function ChatRoom({
   /* -- before Start -------------------------------------------------------- */
   if (status === "not_started") {
     return (
-      <Frame name={teamName} label={onboarding ? "Onboarding" : "Final interview"} status="idle" statusLabel={onboarding ? "WorkRoute team" : "Recruitment team"}>
+      <Frame name={teamName} label={label} status="idle" statusLabel={onboarding ? "WorkRoute team" : "Recruitment team"}>
         <div className="flex flex-1 items-start justify-center overflow-y-auto px-4 py-8 sm:items-center sm:py-12">
           <div className="w-full max-w-lg">
             <div className="overflow-hidden rounded-3xl border border-navy-100 bg-white shadow-card">
               <div className="relative bg-navy-900 px-6 pb-8 pt-7 text-white sm:px-8">
                 <div className="pointer-events-none absolute -right-10 -top-10 h-40 w-40 rounded-full bg-brand-500/20 blur-2xl" />
                 <span className="inline-flex items-center gap-1.5 rounded-full bg-white/10 px-3 py-1 text-[11px] font-bold uppercase tracking-wider text-brand-300">
-                  <Icon name="sparkles" className="h-3.5 w-3.5" /> {onboarding ? "Welcome to the team" : "Final stage"}
+                  <Icon name="sparkles" className="h-3.5 w-3.5" /> {onboarding ? "Welcome to the team" : followup ? "Follow-up" : "Final stage"}
                 </span>
                 <h1 className="mt-4 text-2xl font-extrabold leading-tight text-white sm:text-3xl">
-                  {onboarding ? `Hi ${firstName}, let’s get you started` : `Hi ${firstName}, welcome to your final interview`}
+                  {onboarding
+                    ? `Hi ${firstName}, let’s get you started`
+                    : followup
+                      ? `Hi ${firstName}, a quick follow-up chat`
+                      : `Hi ${firstName}, welcome to your final interview`}
                 </h1>
                 {position ? <p className="mt-2 text-sm text-navy-200">For the {position} role</p> : null}
               </div>
@@ -527,8 +536,17 @@ export function ChatRoom({
                 <p className="text-sm leading-relaxed text-navy-600">
                   {onboarding
                     ? "This is a live text chat with our team. We send you the login for your WorkRoute team portal and show you how everything works."
-                    : "This is a live text chat with our recruitment team. There is no video or call — you answer a few questions in writing, in your own words."}
+                    : followup
+                      ? "Thank you for your interview. We need a little more information from you — this is a short live text chat with our recruitment team, no video or call."
+                      : "This is a live text chat with our recruitment team. There is no video or call — you answer a few questions in writing, in your own words."}
                 </p>
+
+                {followup && reason ? (
+                  <div className="mt-4 rounded-xl border-l-4 border-brand-500 bg-cream-100 px-4 py-3" data-chat-reason>
+                    <p className="text-[11px] font-bold uppercase tracking-wider text-navy-500">What we need</p>
+                    <p className="mt-0.5 text-sm font-semibold text-navy-900">{reason}</p>
+                  </div>
+                ) : null}
 
                 <ol className="mt-5 space-y-3">
                   {(onboarding
@@ -537,7 +555,13 @@ export function ChatRoom({
                         ["We email your portal login", "Your professional email and a temporary password."],
                         ["We show you the portal", "Mail, tickets, bank details and more — about 10 minutes."],
                       ]
-                    : [
+                    : followup
+                      ? [
+                          ["Press Start chat", "You join the queue and we are told you are here."],
+                          ["A recruiter joins you", "Usually within a few minutes during our hours."],
+                          ["Answer a few questions", "It only takes a few minutes."],
+                        ]
+                      : [
                         ["Press Start chat", "You join the queue and we are told you are here."],
                         ["A recruiter joins you", "Usually within a few minutes during our hours."],
                         ["Answer a few questions", "It takes about 15–20 minutes."],
@@ -596,7 +620,7 @@ export function ChatRoom({
   if (status === "ended") {
     const replaced = endedReason === "replaced";
     return (
-      <Frame name={teamName} label={onboarding ? "Onboarding" : "Final interview"} status="ended" statusLabel="Chat ended">
+      <Frame name={teamName} label={label} status="ended" statusLabel="Chat ended">
         <div className="flex flex-1 items-center justify-center overflow-y-auto px-4 py-10">
           <div
             data-chat-ended
@@ -610,7 +634,13 @@ export function ChatRoom({
               <Icon name={replaced ? "chat" : "checkCircle"} className="h-8 w-8" />
             </span>
             <h1 className="mt-5 text-2xl font-extrabold text-navy-900">
-              {replaced ? "This chat was closed" : onboarding ? "Your onboarding chat has ended" : "Your interview has ended"}
+              {replaced
+                ? "This chat was closed"
+                : onboarding
+                  ? "Your onboarding chat has ended"
+                  : followup
+                    ? "Your follow-up chat has ended"
+                    : "Your interview has ended"}
             </h1>
             <p className="mt-3 text-sm leading-relaxed text-navy-600">
               {replaced
@@ -629,7 +659,7 @@ export function ChatRoom({
   const statusLabel = status === "active" ? "Online" : onboarding ? "Waiting for our team" : "Waiting for a recruiter";
 
   return (
-    <Frame name={teamName} label={onboarding ? "Onboarding" : "Final interview"} status={status} statusLabel={statusLabel} offline={offline}>
+    <Frame name={teamName} label={label} status={status} statusLabel={statusLabel} offline={offline}>
       <div className="relative min-h-0 flex-1">
         <div ref={listRef} onScroll={onScroll} className="h-full overflow-y-auto overscroll-contain">
           <div

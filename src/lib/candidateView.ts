@@ -219,6 +219,9 @@ export interface CandidateView {
   chatLinkSentAt?: string;
   chatLinks?: string[];
   onboardingChatLinks?: string[];
+  followupChatLinks?: string[];
+  /** Where the latest follow-up chat stands (from the chat files, filled in by the page). */
+  followupState?: "sent" | "started" | "done";
   /**
    * Whether the current chat link has opened a conversation. Not on the record
    * itself — it lives in the chat store — so pages that need it (Accepted) set
@@ -442,6 +445,7 @@ export function toCandidateView(
     chatLinkSentAt: c.chatLinkSentAt,
     chatLinks: c.chatLinks,
     onboardingChatLinks: c.onboardingChatLinks,
+    followupChatLinks: c.followupChatLinks,
     chatRemindedAt: (c.liveReminders ?? []).filter((r) => (r.kind ?? "live") === "nudge").at(-1)?.sentAt,
     fullyVerifiedAt: c.fullyVerifiedAt,
     submissionAckSentAt: c.submissionAckSentAt,

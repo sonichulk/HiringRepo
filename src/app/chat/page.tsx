@@ -112,6 +112,9 @@ export default async function ChatPage({
       position={candidate.offer?.position || candidate.position || undefined}
       hours={settings.hours}
       kind={kind}
+      reason={
+        kind === "followup" ? session?.reason ?? candidate.followupReasons?.[access.link.sentAt] : undefined
+      }
       initial={initial}
       reminder={isReminderId(reminder) && !session?.endedAt ? reminder : undefined}
     />
