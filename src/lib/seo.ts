@@ -54,6 +54,6 @@ export function organizationJsonLd() {
       postalCode: siteConfig.contact.address.postalCode,
       addressCountry: siteConfig.contact.address.country,
     },
-    sameAs: siteConfig.social.map((s) => s.href),
+    ...(siteConfig.social.length ? { sameAs: siteConfig.social.map((s) => s.href) } : {}),
   };
 }

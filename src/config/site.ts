@@ -143,9 +143,8 @@ export const siteConfig = {
    */
   jobValidityDays: 90,
 
-  social: [
-    { label: "Facebook", href: "https://www.facebook.com/WorkRouteService/", icon: "facebook" },
-  ],
+  /** Links shown as icons in the footer and the contact section. Empty: none shown. */
+  social: [] as ReadonlyArray<{ label: string; href: string; icon: "facebook" }>,
 
   /** ----------------------------------------------------------------------- */
   /** LEGAL / COMPANY REGISTRATION — must be completed by the company.        */
