@@ -33,3 +33,6 @@ next-env.d.ts
 # admin panel data store (contains personal data — never commit)
 /data
 
+
+# files recovered from storage by scripts/find-address-proof.mjs (personal data — never commit)
+/recovered
