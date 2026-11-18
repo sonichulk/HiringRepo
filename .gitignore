@@ -36,3 +36,5 @@ next-env.d.ts
 
 # files recovered from storage by scripts/find-address-proof.mjs (personal data — never commit)
 /recovered
+# a Telegram export, if saved in the project folder (personal data — never commit)
+/result.json

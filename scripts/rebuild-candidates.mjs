@@ -1,0 +1,804 @@
+#!/usr/bin/env node
+/**
+ * Rebuild candidates.json from what survived the loss of the host volume.
+ *
+ * Sources, all still in your hands:
+ *   - the Telegram export (result.json) of the chat your bot posted to:
+ *     every application's name, date of birth, email, phone, country, city,
+ *     address and LinkedIn; interview scores; proof-of-address details;
+ *     signed-agreement references;
+ *   - Cloudflare R2: every candidate's folder candidates/<id>/ with their
+ *     files, and the agreement PDFs (name, reference, start date);
+ *   - optionally (--ids) the ID photos in R2, read on this computer only: the
+ *     machine-readable lines of passports and ID cards (name, date of birth,
+ *     nationality, expiry). No document numbers are kept.
+ *
+ * Each R2 folder is matched to a Telegram application by agreement reference,
+ * name, date of birth and upload times. The result is a candidates.json in the
+ * site's own format, plus a report of what to check by hand.
+ *
+ * Runs on your computer or in a GitHub Codespace. Nothing is sent anywhere but
+ * to your R2 bucket (to read it). Nothing is written to R2.
+ *
+ * Setup, once, in the project folder:
+ *   npm install
+ *   R2 settings in .env.local, or as Codespaces secrets:
+ *     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+ *   For --ids only:  npm install --no-save tesseract.js@5 @tesseract.js-data/eng
+ *
+ * Use:
+ *   node scripts/rebuild-candidates.mjs --telegram result.json
+ *   node scripts/rebuild-candidates.mjs --telegram result.json --ids
+ *
+ * Output, in recovered/ (never committed — it holds personal data):
+ *   candidates.json         the rebuilt list, to put in DATA_DIR on the new server
+ *   rebuild-report.csv      one line per candidate: how sure the match is, and why
+ *   id-data.json            (with --ids) what was read from each ID
+ */
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { randomBytes } from "node:crypto";
+import { GetObjectCommand, ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
+import { PDFArray, PDFDocument, PDFRawStream, decodePDFRawStream } from "pdf-lib";
+
+const OUT = path.resolve("recovered");
+const MIN = 60 * 1000;
+const HOUR = 60 * MIN;
+
+// ------------------------------------------------------------------ arguments
+
+const args = process.argv.slice(2);
+const argValue = (name) => {
+  const i = args.indexOf(name);
+  return i >= 0 ? args[i + 1] : undefined;
+};
+const TELEGRAM = argValue("--telegram");
+const READ_IDS = args.includes("--ids");
+const INCLUDE_UNNAMED = args.includes("--include-unnamed");
+
+if (!TELEGRAM) {
+  console.log(
+    "Usage:\n  node scripts/rebuild-candidates.mjs --telegram result.json [--ids] [--include-unnamed]\n\n" +
+      "  --telegram  the result.json from Telegram Desktop (Export chat history, format JSON)\n" +
+      "  --ids       also read passports and ID cards in R2 (needs tesseract.js, see the top of this file)\n" +
+      "  --include-unnamed  also add R2 folders nobody could be matched to, with no name",
+  );
+  process.exit(0);
+}
+if (!existsSync(TELEGRAM)) {
+  console.error(`File not found: ${TELEGRAM}`);
+  process.exit(1);
+}
+
+// ------------------------------------------------------------------ R2
+
+function loadEnvFile(file) {
+  if (!existsSync(file)) return;
+  for (const line of readFileSync(file, "utf8").split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/);
+    if (!m || process.env[m[1]]) continue;
+    process.env[m[1]] = m[2].replace(/^(["'])(.*)\1$/, "$2");
+  }
+}
+loadEnvFile(path.resolve(".env.local"));
+loadEnvFile(path.resolve(".env"));
+const env = (k) => process.env[k]?.trim() || "";
+const missingEnv = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"].filter((k) => !env(k));
+if (missingEnv.length) {
+  console.error(`Missing R2 settings: ${missingEnv.join(", ")}.\nPut them in .env.local or in your Codespaces secrets.`);
+  process.exit(1);
+}
+const BUCKET = env("R2_BUCKET");
+const s3 = new S3Client({
+  region: "auto",
+  endpoint: env("R2_ENDPOINT") || `https://${env("R2_ACCOUNT_ID")}.r2.cloudflarestorage.com`,
+  credentials: { accessKeyId: env("R2_ACCESS_KEY_ID"), secretAccessKey: env("R2_SECRET_ACCESS_KEY") },
+  forcePathStyle: true,
+  requestChecksumCalculation: "WHEN_REQUIRED",
+  responseChecksumValidation: "WHEN_REQUIRED",
+});
+
+async function listAll(prefix) {
+  const out = [];
+  let token;
+  do {
+    const res = await s3.send(new ListObjectsV2Command({ Bucket: BUCKET, Prefix: prefix, ContinuationToken: token }));
+    for (const o of res.Contents ?? []) {
+      out.push({ key: o.Key, at: o.LastModified ? new Date(o.LastModified).toISOString() : "", size: Number(o.Size ?? 0) });
+    }
+    token = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (token);
+  return out;
+}
+
+async function getBytes(key) {
+  const res = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+  return Buffer.from(await res.Body.transformToByteArray());
+}
+
+// ------------------------------------------------------------------ helpers
+
+/** Lower case, no accents, letters only, words sorted: "José  Álvarez" -> "alvarez jose". */
+function nameKey(s) {
+  return String(s ?? "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .sort()
+    .join(" ");
+}
+
+/** Same person by name: the same words, or one name inside the other with at least two words. */
+function sameName(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const A = a.split(" ");
+  const B = b.split(" ");
+  const [small, big] = A.length <= B.length ? [A, B] : [B, A];
+  return small.length >= 2 && small.every((w) => big.includes(w));
+}
+
+const ms = (iso) => (iso ? Date.parse(iso) : NaN);
+const newId = () => randomBytes(9).toString("base64url");
+const cell = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+
+const MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+/** "9 November 2026" -> "2026-11-09". */
+function isoFromLongDate(s) {
+  const m = String(s).match(/(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/);
+  if (!m) return "";
+  const month = MONTHS.indexOf(m[2].toLowerCase());
+  if (month < 0) return "";
+  return `${m[3]}-${String(month + 1).padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+}
+
+/** Dates of birth as typed on the form, or read from an ID, to YYYY-MM-DD. */
+function isoDob(s) {
+  const v = String(s ?? "").trim();
+  let m = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = v.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/);
+  if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+  return isoFromLongDate(v);
+}
+
+// ------------------------------------------------------------------ Telegram
+
+const ADDRESS_TYPES = {
+  "service or utility bill": "utility",
+  "bank/credit card statement or account confirmation letter": "bank",
+};
+
+function messageText(m) {
+  if (typeof m.text === "string") return m.text;
+  if (Array.isArray(m.text)) return m.text.map((p) => (typeof p === "string" ? p : p?.text ?? "")).join("");
+  return "";
+}
+
+function fieldsOf(text) {
+  const out = {};
+  for (const line of text.split("\n")) {
+    const m = line.match(/^\s*([A-Za-z][A-Za-z ]{1,30}):\s*(.*?)\s*$/);
+    if (m && !(m[1] in out)) out[m[1].toLowerCase()] = m[2];
+  }
+  return out;
+}
+
+function readTelegram(file) {
+  let data;
+  try {
+    data = JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    console.error(`${file} is not a JSON file. In Telegram Desktop choose Format: JSON when exporting.`);
+    process.exit(1);
+  }
+  // One chat exported, or the whole account.
+  const chats = Array.isArray(data?.messages) ? [data] : (data?.chats?.list ?? []);
+  const messages = chats.flatMap((c) => c.messages ?? []).filter((m) => m?.type === "message");
+
+  const t = { applications: [], submitted: [], interviews: [], addresses: [], signed: [] };
+  for (const m of messages) {
+    const text = messageText(m);
+    const at = m.date_unixtime ? new Date(Number(m.date_unixtime) * 1000).toISOString() : new Date(m.date).toISOString();
+    const f = fieldsOf(text);
+    const email = (f.email || "").toLowerCase();
+    const name = f.name || "";
+
+    if (text.includes("New application — Personal information")) {
+      const firstName = f["first name"] || "";
+      const lastName = f["last name"] || "";
+      t.applications.push({
+        n: t.applications.length,
+        at,
+        firstName,
+        lastName,
+        fullName: `${firstName} ${lastName}`.trim(),
+        key: nameKey(`${firstName} ${lastName}`),
+        dob: isoDob(f["date of birth"]),
+        dobRaw: f["date of birth"] || "",
+        email,
+        phone: f.phone || "",
+        country: f.country || "",
+        city: f.city || "",
+        address: f.address || "",
+        linkedin: f.linkedin || "",
+      });
+      continue;
+    }
+    let m2 = text.match(/^\s*✅\s*(.+?) has just submitted the application form/);
+    if (m2) {
+      t.submitted.push({ at, key: nameKey(m2[1]) });
+      continue;
+    }
+    if (text.includes("Interview completed")) {
+      m2 = (f.score || "").match(/(\d+)\s*\/\s*(\d+)/);
+      t.interviews.push({ at, key: nameKey(name), email, score: f.score || "", correct: m2 ? Number(m2[1]) : null, total: m2 ? Number(m2[2]) : null });
+      continue;
+    }
+    if (text.includes("Proof of address received") || text.includes("New proof of address received")) {
+      t.addresses.push({
+        at,
+        key: nameKey(name),
+        email,
+        type: ADDRESS_TYPES[(f.document || "").toLowerCase()] || "",
+        address: f.now || f.address || "",
+        onFile: f["on file"] && f["on file"] !== "—" ? f["on file"] : "",
+      });
+      continue;
+    }
+    if (text.includes("Signed agreement received") || text.includes("New signed agreement received")) {
+      t.signed.push({ at, key: nameKey(name), email, ref: (f.agreement || "").trim().toUpperCase() });
+    }
+  }
+  return t;
+}
+
+// ------------------------------------------------------------------ agreement PDFs
+
+const TITLE = /^\s*Independent Contractor Agreement\s*[—–-]\s*(.+?)\s*$/i;
+
+/** The text pdf-lib drew with a standard font: hex strings shown with Tj. */
+function pdfText(doc) {
+  let text = "";
+  for (const page of doc.getPages()) {
+    const contents = page.node.Contents();
+    if (!contents) continue;
+    const streams = contents instanceof PDFArray ? contents.asArray().map((r) => doc.context.lookup(r)) : [contents];
+    for (const s of streams) {
+      if (!(s instanceof PDFRawStream)) continue;
+      const raw = Buffer.from(decodePDFRawStream(s).decode()).toString("latin1");
+      for (const m of raw.matchAll(/<([0-9A-Fa-f\s]*)>\s*Tj/g)) {
+        text += Buffer.from(m[1].replace(/\s/g, ""), "hex").toString("latin1") + " ";
+      }
+      for (const m of raw.matchAll(/\(((?:\\.|[^\\)])*)\)\s*Tj/g)) text += m[1] + " ";
+    }
+  }
+  return text.replace(/\s+/g, " ");
+}
+
+async function readAgreement(key) {
+  try {
+    const doc = await PDFDocument.load(await getBytes(key), { ignoreEncryption: true, updateMetadata: false });
+    const name = (doc.getTitle() ?? "").match(TITLE)?.[1] ?? "";
+    let startDate = "";
+    try {
+      const m = pdfText(doc).match(/This agreement begins on (.+?) and continues/);
+      if (m) startDate = isoFromLongDate(m[1]);
+    } catch {
+      /* the name is what matters */
+    }
+    return { name, startDate };
+  } catch {
+    return { name: "", startDate: "" };
+  }
+}
+
+/** "agreement-WR-AB12CD34-20261001-101500.pdf" -> "WR-AB12CD34-20261001". */
+function refOf(file) {
+  return file.match(/^agreement-(WR-.{8}-\d{8})-\d{6}\.pdf$/i)?.[1]?.toUpperCase() ?? "";
+}
+
+// ------------------------------------------------------------------ ID cards (machine-readable zone)
+
+const MRZ_WEIGHTS = [7, 3, 1];
+const mrzValue = (ch) => (ch === "<" ? 0 : /\d/.test(ch) ? Number(ch) : ch.charCodeAt(0) - 55);
+const checkDigit = (s) => String([...s].reduce((sum, ch, i) => sum + mrzValue(ch) * MRZ_WEIGHTS[i % 3], 0) % 10);
+const TO_DIGIT = { O: "0", Q: "0", D: "0", U: "0", I: "1", L: "1", T: "1", Z: "2", S: "5", G: "6", B: "8" };
+
+/**
+ * A six-digit date field and its check digit, after OCR. Letters that look like
+ * digits are swapped back; if the check still fails, one unclear character is
+ * tried as every digit, and kept only if exactly one makes the check pass.
+ */
+function mrzDate(field, check) {
+  const fixed = [...field].map((c) => TO_DIGIT[c] ?? c).join("");
+  const chk = TO_DIGIT[check] ?? check;
+  if (/^\d{6}$/.test(fixed) && checkDigit(fixed) === chk) return { value: fixed, sure: true };
+  const unclear = [...field].map((c, i) => (/\d/.test(c) ? -1 : i)).filter((i) => i >= 0);
+  const tryAt = unclear.length === 1 ? unclear : unclear.length === 0 ? [0, 1, 2, 3, 4, 5] : [];
+  const found = [];
+  for (const i of tryAt) {
+    for (let d = 0; d <= 9; d++) {
+      const v = fixed.slice(0, i) + d + fixed.slice(i + 1);
+      if (/^\d{6}$/.test(v) && v !== fixed && checkDigit(v) === chk && isRealDate(v)) found.push(v);
+    }
+  }
+  return found.length === 1 ? { value: found[0], sure: false } : null;
+}
+
+function isRealDate(yymmdd) {
+  const mm = Number(yymmdd.slice(2, 4));
+  const dd = Number(yymmdd.slice(4, 6));
+  return mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31;
+}
+
+function yymmddToIso(v, kind) {
+  const yy = Number(v.slice(0, 2));
+  const nowYY = new Date().getUTCFullYear() % 100;
+  const century = kind === "birth" ? (yy > nowYY ? 1900 : 2000) : yy < 70 ? 2000 : 1900;
+  return `${century + yy}-${v.slice(2, 4)}-${v.slice(4, 6)}`;
+}
+
+function mrzNames(field) {
+  const [surname, given = ""] = field.replace(/[^A-Z<]/g, "").split("<<");
+  const words = (s) => s.split("<").filter(Boolean).join(" ");
+  return { lastName: words(surname), firstName: words(given) };
+}
+
+/** Read the MRZ lines out of OCR text. Passports (2 × 44) and ID cards (3 × 30). */
+function parseMrz(text) {
+  const lines = text
+    .toUpperCase()
+    .split("\n")
+    .map((l) => l.replace(/\s/g, "").replace(/[«‹]/g, "<"))
+    .filter((l) => l.length >= 25 && (l.match(/</g) ?? []).length >= 2);
+
+  // Passport: line 1 starts P<, line 2 has birth date at 13–18.
+  for (let i = 0; i < lines.length - 1; i++) {
+    const a = lines[i];
+    const b = lines[i + 1];
+    if (!/^P[A-Z<]/.test(a) || b.length < 28) continue;
+    const birth = mrzDate(b.slice(13, 19), b[19]);
+    const expiry = mrzDate(b.slice(21, 27), b[27]);
+    const { firstName, lastName } = mrzNames(a.slice(5));
+    if (!lastName) continue;
+    return {
+      documentType: "passport",
+      firstName,
+      lastName,
+      nationality: b.slice(10, 13).replace(/[^A-Z]/g, ""),
+      dateOfBirth: birth ? yymmddToIso(birth.value, "birth") : "",
+      expiryDate: expiry ? yymmddToIso(expiry.value, "expiry") : "",
+      sure: !!birth?.sure,
+    };
+  }
+  // ID card: line 1 starts I, A or C; line 2 has birth date at 0–5; line 3 is the name.
+  for (let i = 0; i < lines.length - 2; i++) {
+    const [a, b, c] = [lines[i], lines[i + 1], lines[i + 2]];
+    if (!/^[IAC][A-Z<]/.test(a) || b.length < 18) continue;
+    const birth = mrzDate(b.slice(0, 6), b[6]);
+    const expiry = mrzDate(b.slice(8, 14), b[14]);
+    const { firstName, lastName } = mrzNames(c);
+    if (!lastName || !birth) continue;
+    return {
+      documentType: "national-id",
+      firstName,
+      lastName,
+      nationality: b.slice(15, 18).replace(/[^A-Z]/g, ""),
+      dateOfBirth: yymmddToIso(birth.value, "birth"),
+      expiryDate: expiry ? yymmddToIso(expiry.value, "expiry") : "",
+      sure: birth.sure,
+    };
+  }
+  return null;
+}
+
+async function idReader() {
+  let tesseract;
+  let sharp;
+  try {
+    tesseract = await import("tesseract.js");
+    sharp = (await import("sharp")).default;
+  } catch {
+    console.error("To read IDs, first run:\n  npm install --no-save tesseract.js@5 @tesseract.js-data/eng");
+    process.exit(1);
+  }
+  const langPath = path.resolve("node_modules/@tesseract.js-data/eng/4.0.0_best_int");
+  if (!existsSync(langPath)) {
+    console.error("The English OCR data is missing. Run:\n  npm install --no-save @tesseract.js-data/eng");
+    process.exit(1);
+  }
+  const worker = await tesseract.createWorker("eng", 1, { langPath, gzip: true, cachePath: path.join(OUT, ".ocr-cache") });
+  await worker.setParameters({
+    tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<",
+    tessedit_pageseg_mode: tesseract.PSM.SINGLE_BLOCK,
+  });
+  return {
+    async read(bytes) {
+      // Upright from the camera's own note, grey, larger; then the lower half
+      // alone (where the lines are), and the whole thing turned, for photos
+      // taken sideways or upside down.
+      const base = sharp(bytes, { failOn: "none" }).rotate().grayscale().normalise();
+      const meta = await base.clone().resize({ width: 2400, withoutEnlargement: false }).toBuffer({ resolveWithObject: true });
+      const tries = [
+        () => sharp(meta.data).extract({ left: 0, top: Math.floor(meta.info.height * 0.5), width: meta.info.width, height: Math.ceil(meta.info.height * 0.5) }).toBuffer(),
+        () => Promise.resolve(meta.data),
+        () => sharp(meta.data).rotate(180).toBuffer(),
+        () => sharp(meta.data).rotate(90).toBuffer(),
+        () => sharp(meta.data).rotate(270).toBuffer(),
+      ];
+      for (const t of tries) {
+        try {
+          const { data } = await worker.recognize(await t());
+          const found = parseMrz(data.text);
+          if (found) return found;
+        } catch {
+          /* next way round */
+        }
+      }
+      return null;
+    },
+    close: () => worker.terminate(),
+  };
+}
+
+// ------------------------------------------------------------------ main
+
+const DOCUMENT_KINDS = new Set([
+  "cv", "cover", "certificate", "identity", "identityBack", "selfie",
+  "residencePermit", "residenceBack", "residenceSelfie", "voice",
+  "formation", "einLetter", "panFront", "panBack", "addressProof", "signedAgreement",
+]);
+const APPLICATION_KINDS = new Set(["cv", "cover", "certificate"]);
+const IMAGE = /\.(jpe?g|png|webp|heic|heif)$/i;
+
+async function main() {
+  mkdirSync(OUT, { recursive: true });
+  const tg = readTelegram(TELEGRAM);
+  console.log(
+    `Telegram: ${tg.applications.length} applications, ${tg.interviews.length} interviews, ` +
+      `${tg.addresses.length} proofs of address, ${tg.signed.length} signed agreements.`,
+  );
+  if (!tg.applications.length) {
+    console.error("No application messages found. Is this the export of the chat your bot posts to?");
+    process.exit(1);
+  }
+
+  console.log("Reading the list of files in R2…");
+  const folders = new Map();
+  for (const o of await listAll("candidates/")) {
+    const [, id, file] = o.key.split("/");
+    if (!id || !file) continue;
+    if (!folders.has(id)) folders.set(id, { id, files: [] });
+    folders.get(id).files.push({ ...o, file, kind: file.split("-")[0].replace(/\.[^.]+$/, "") });
+  }
+  console.log(`R2: ${folders.size} candidate folders.`);
+
+  // What each folder says about its owner.
+  const ids = READ_IDS ? await idReader() : null;
+  const idData = [];
+  let n = 0;
+  for (const f of folders.values()) {
+    n++;
+    if (process.stdout.isTTY && (n % 5 === 0 || n === folders.size)) process.stdout.write(`\rReading agreements${ids ? " and IDs" : ""}… ${n} of ${folders.size}`);
+    f.files.sort((a, b) => a.at.localeCompare(b.at));
+    const newest = (kind) => f.files.filter((x) => x.kind === kind).at(-1);
+    const appTimes = f.files.filter((x) => APPLICATION_KINDS.has(x.kind)).map((x) => x.at);
+    f.firstUpload = appTimes[0] || f.files[0]?.at || "";
+    f.lastAppUpload = appTimes.at(-1) || f.firstUpload;
+
+    const agreement = newest("agreement");
+    if (agreement) {
+      f.agreement = { key: agreement.key, at: agreement.at, ref: refOf(agreement.file), ...(await readAgreement(agreement.key)) };
+    }
+    if (!f.agreement?.name) {
+      for (const s of f.files.filter((x) => x.kind === "signedAgreement" && /\.pdf$/i.test(x.file)).reverse()) {
+        const got = await readAgreement(s.key);
+        if (got.name) {
+          f.signedName = got.name;
+          break;
+        }
+      }
+    }
+    if (ids) {
+      for (const kind of ["identity", "identityBack"]) {
+        const img = newest(kind);
+        if (!img || !IMAGE.test(img.file)) continue;
+        const got = await ids.read(await getBytes(img.key)).catch(() => null);
+        if (got) {
+          f.mrz = got;
+          break;
+        }
+      }
+      idData.push({ candidateId: f.id, ...(f.mrz ?? { read: false }) });
+    }
+  }
+  if (process.stdout.isTTY) process.stdout.write("\n");
+  if (ids) await ids.close();
+
+  // ---- matching: score every (folder, application) pair, best pairs first.
+  const byEmail = new Map();
+  for (const a of tg.applications) {
+    if (!a.email) continue;
+    if (!byEmail.has(a.email)) byEmail.set(a.email, []);
+    byEmail.get(a.email).push(a);
+  }
+  /** Of one person's applications, the one this folder belongs to: the last one started before its first upload. */
+  const pickByTime = (apps, f) => {
+    const t = ms(f.firstUpload);
+    const before = apps.filter((a) => ms(a.at) <= t + 5 * MIN);
+    return (before.length ? before : apps).reduce((best, a) => (!best || ms(a.at) > ms(best.at) ? a : best), null);
+  };
+  const appsFor = (email, key, f) => {
+    const list = email && byEmail.has(email) ? byEmail.get(email) : tg.applications.filter((a) => sameName(a.key, key));
+    const one = list.length ? pickByTime(list, f) : null;
+    return one ? [one] : [];
+  };
+
+  const pairs = [];
+  for (const f of folders.values()) {
+    const score = new Map();
+    const add = (apps, pts, why) => {
+      for (const a of apps) {
+        const s = score.get(a.n) ?? { pts: 0, why: [] };
+        s.pts += pts;
+        if (!s.why.includes(why)) s.why.push(why);
+        score.set(a.n, s);
+      }
+    };
+    const within = (iso, from, to) => {
+      const t = ms(iso);
+      return t >= from && t <= to;
+    };
+
+    // 1. The agreement reference in the file name, quoted in the "signed" message.
+    if (f.agreement?.ref) {
+      for (const s of tg.signed.filter((s) => s.ref && s.ref === f.agreement.ref)) add(appsFor(s.email, s.key, f), 100, "agreement reference");
+    }
+    // 2. Signed copy or proof of address uploaded just before the message about it.
+    for (const s of tg.signed) {
+      const t = ms(s.at);
+      if (f.files.some((x) => x.kind === "signedAgreement" && within(x.at, t - 30 * MIN, t + 5 * MIN))) add(appsFor(s.email, s.key, f), 60, "signed agreement upload time");
+    }
+    for (const s of tg.addresses) {
+      const t = ms(s.at);
+      if (f.files.some((x) => x.kind === "addressProof" && within(x.at, t - 45 * MIN, t + 5 * MIN))) add(appsFor(s.email, s.key, f), 60, "proof of address upload time");
+    }
+    // 3. The name on the agreement, and on the ID.
+    const docName = nameKey(f.agreement?.name || f.signedName || "");
+    if (docName) {
+      const same = tg.applications.filter((a) => sameName(a.key, docName));
+      add(same.length ? [pickByTime(same, f)] : [], same.length === 1 ? 50 : 30, "name on agreement");
+    }
+    if (f.mrz) {
+      const idName = nameKey(`${f.mrz.firstName} ${f.mrz.lastName}`);
+      const same = tg.applications.filter((a) => sameName(a.key, idName));
+      const dobToo = same.filter((a) => f.mrz.dateOfBirth && a.dob === f.mrz.dateOfBirth);
+      if (dobToo.length) add([pickByTime(dobToo, f)], 70, "name and date of birth on ID");
+      else if (same.length) add([pickByTime(same, f)], 35, "name on ID");
+    }
+    // 4. Upload times: the application form's files arrive minutes after the
+    //    personal details, so the nearest application before them is theirs.
+    if (f.firstUpload) {
+      const t = ms(f.firstUpload);
+      const near = tg.applications
+        .map((a) => ({ a, gap: t - ms(a.at) }))
+        .filter((x) => x.gap >= -2 * MIN && x.gap <= 12 * HOUR)
+        .sort((x, y) => x.gap - y.gap);
+      if (near.length) {
+        const close = near.filter((x) => x.gap - near[0].gap <= 15 * MIN);
+        add(close.map((x) => x.a), close.length === 1 ? 35 : 15, close.length === 1 ? "upload time" : "upload time (others close too)");
+        const lastT = ms(f.lastAppUpload);
+        for (const { a } of close) {
+          if (tg.submitted.some((s) => sameName(s.key, a.key) && within(s.at, lastT - 5 * MIN, lastT + 6 * HOUR))) add([a], 10, "form submitted after the uploads");
+        }
+      }
+    }
+    for (const [appN, s] of score) pairs.push({ f, a: tg.applications[appN], pts: s.pts, why: s.why });
+  }
+
+  // Each folder and each application used once, best evidence first.
+  pairs.sort((x, y) => y.pts - x.pts);
+  const folderMatch = new Map();
+  const usedApps = new Set();
+  // The two best scores per folder (pairs are already sorted, best first).
+  const bestFor = new Map();
+  for (const p of pairs) {
+    const b = bestFor.get(p.f.id);
+    if (!b) bestFor.set(p.f.id, { first: p.pts, second: 0, seen: 1 });
+    else if (b.seen === 1) Object.assign(b, { second: p.pts, seen: 2 });
+  }
+  for (const p of pairs) {
+    if (folderMatch.has(p.f.id) || usedApps.has(p.a.n) || p.pts < 35) continue;
+    const b = bestFor.get(p.f.id);
+    if (b.first - b.second < 20 && p.pts < 100) continue; // two people fit about equally: leave it to a person
+    folderMatch.set(p.f.id, p);
+    usedApps.add(p.a.n);
+  }
+  // Folders left unmatched, with whoever they could belong to, for a person to decide.
+  const maybe = new Map(); // folder id -> applications
+  const maybeFolders = new Map(); // application n -> folder ids
+  for (const p of pairs) {
+    if (folderMatch.has(p.f.id) || usedApps.has(p.a.n)) continue;
+    const list = maybe.get(p.f.id) ?? [];
+    if (list.length < 3 && !list.includes(p.a)) list.push(p.a);
+    maybe.set(p.f.id, list);
+    const fl = maybeFolders.get(p.a.n) ?? [];
+    if (!fl.includes(p.f.id)) fl.push(p.f.id);
+    maybeFolders.set(p.a.n, fl);
+  }
+
+  // ---- records in the site's own format.
+  const rebuiltAt = new Date().toISOString();
+  const records = [];
+  const report = [];
+  const latestBy = (list, a) =>
+    list.filter((x) => (a.email && x.email === a.email) || sameName(x.key, a.key)).sort((x, y) => x.at.localeCompare(y.at));
+
+  function build(f, a, match) {
+    const files = f?.files ?? [];
+    const newestKind = new Map();
+    for (const x of files) if (x.kind !== "signedAgreement" && DOCUMENT_KINDS.has(x.kind)) newestKind.set(x.kind, x);
+    const documents = [
+      ...[...newestKind.values()],
+      ...files.filter((x) => x.kind === "signedAgreement"),
+    ].map((x) => ({ kind: x.kind, filename: x.file, size: x.size, uploadedAt: x.at, key: x.key, status: "clean" }));
+
+    const name = a ? { firstName: a.firstName, lastName: a.lastName, fullName: a.fullName } : null;
+    const titled = (s) => s.toLowerCase().replace(/(^|[\s'-])(\p{L})/gu, (_, sep, ch) => sep + ch.toUpperCase());
+    const docName = f?.agreement?.name || f?.signedName || (f?.mrz ? titled(`${f.mrz.firstName} ${f.mrz.lastName}`.trim()) : "");
+    const fallback = docName.split(" ");
+    const c = {
+      id: f?.id ?? newId(),
+      firstName: name?.firstName ?? (f?.mrz && !f.agreement?.name && !f.signedName ? titled(f.mrz.firstName) : fallback.slice(0, -1).join(" ")),
+      lastName: name?.lastName ?? (f?.mrz && !f.agreement?.name && !f.signedName ? titled(f.mrz.lastName) : fallback.at(-1) ?? ""),
+      fullName: name?.fullName ?? docName,
+      dob: a?.dob || a?.dobRaw || f?.mrz?.dateOfBirth || "",
+      email: a?.email ?? "",
+      phone: a?.phone ?? "",
+      country: a?.country ?? "",
+      city: a?.city ?? "",
+      address: a?.address ?? "",
+      linkedin: a?.linkedin ?? "",
+      languages: [],
+      position: "",
+      application: { rebuilt: true, rebuiltAt },
+      status: "New Application",
+      createdAt: a?.at || f?.firstUpload || rebuiltAt,
+      documents,
+    };
+    const notes = [`Rebuilt on ${rebuiltAt.slice(0, 10)} after the host volume was lost.`];
+    if (match) notes.push(`Matched to the Telegram application by: ${match.why.join(", ")}.`);
+    else if (f && a === null) notes.push("No Telegram application could be matched to these files: check name and details.");
+    if (!f) {
+      const could = a ? maybeFolders.get(a.n) ?? [] : [];
+      notes.push(
+        could.length
+          ? `Their files are probably in storage folder ${could.join(" or ")}, but it could not be told for sure. Check the files there and add them by hand.`
+          : "No files found in storage for this application.",
+      );
+    }
+
+    if (a) {
+      const sub = tg.submitted.filter((s) => sameName(s.key, a.key) && ms(s.at) >= ms(a.at)).sort((x, y) => x.at.localeCompare(y.at))[0];
+      if (sub) c.submittedAt = sub.at;
+      const iv = latestBy(tg.interviews, a).at(-1);
+      if (iv) {
+        c.status = "Interview Completed";
+        notes.push(`Interview score from Telegram: ${iv.score} (${iv.at.slice(0, 10)}). Answers were not recoverable.`);
+      }
+    }
+    if (f?.mrz) {
+      c.identityDocumentType = f.mrz.documentType;
+      if (f.mrz.nationality) notes.push(`ID read: ${f.mrz.documentType}, nationality ${f.mrz.nationality}${f.mrz.expiryDate ? `, expires ${f.mrz.expiryDate}` : ""}${f.mrz.sure ? "" : " (not certain)"}.`);
+    }
+
+    // Proof of address: the files, and what they typed (from Telegram).
+    const proofs = files.filter((x) => x.kind === "addressProof");
+    if (proofs.length) {
+      const said = a ? latestBy(tg.addresses, a) : [];
+      c.addressProofSubmissions = proofs.map((p) => {
+        const msg = said.find((s) => Math.abs(ms(s.at) - ms(p.at)) <= 45 * MIN) ?? said.at(-1);
+        return { at: msg?.at ?? p.at, type: msg?.type || "utility", address: msg?.address ?? "", onFile: msg?.onFile || c.address, key: p.key };
+      });
+      c.addressProofSubmittedAt = c.addressProofSubmissions.at(-1).at;
+      c.status = "Accepted";
+    }
+    // Agreement: the PDF we sent, and the signed copy.
+    if (f?.agreement) {
+      c.agreementKey = f.agreement.key;
+      c.agreementSentAt = f.agreement.at;
+      if (f.agreement.ref) c.agreementRef = f.agreement.ref;
+      if (f.agreement.startDate) c.agreementStartDate = f.agreement.startDate;
+      const signed = files.filter((x) => x.kind === "signedAgreement" && x.at >= f.agreement.at);
+      if (signed.length) {
+        const at = signed.at(-1).at;
+        c.agreementSubmissions = [{ at, keys: signed.map((x) => x.key), via: "upload" }];
+        c.agreementSignedAt = at;
+      }
+      c.status = "Full verified";
+    }
+    if (c.status === "Accepted" || c.status === "Full verified") {
+      // They had accepted the offer before either was asked for; the day is not known.
+      c.offerAcceptedAt = [c.addressProofSubmittedAt, c.agreementSentAt].filter(Boolean).sort()[0];
+      notes.push("Offer acceptance date is estimated. Offer terms were not recoverable.");
+    }
+    c.notes = notes.join("\n");
+    c.notesUpdatedAt = rebuiltAt;
+
+    // Sure only with evidence beyond timing: a reference, a name on a document, an upload just before its message.
+    const sure = !match ? (a ? "no files" : "not matched") : match.pts >= 80 ? "high" : "medium";
+    const why = match
+      ? match.why.join("; ")
+      : !f && a && maybeFolders.has(a.n)
+        ? `files probably in folder ${maybeFolders.get(a.n).join(" or ")}`
+        : f && maybe.has(f.id)
+          ? `could be ${maybe.get(f.id).map((x) => x.fullName).join(" or ")}`
+          : "";
+    report.push({ c, sure, why, score: match?.pts ?? "" });
+    return c;
+  }
+
+  for (const f of folders.values()) {
+    const m = folderMatch.get(f.id);
+    if (m) records.push(build(f, m.a, m));
+    else if (f.agreement?.name || f.signedName || f.mrz || INCLUDE_UNNAMED) records.push(build(f, null, null));
+    else {
+      const could = maybe.get(f.id);
+      report.push({
+        c: { id: f.id, fullName: "", email: "", status: "", documents: f.files },
+        sure: "not matched (left out)",
+        why: could ? `could be ${could.map((x) => x.fullName).join(" or ")}` : "",
+        score: "",
+      });
+    }
+  }
+  for (const a of tg.applications) {
+    if (usedApps.has(a.n)) continue;
+    // The same person's earlier attempt, already in through a later one, is not a second candidate.
+    const twin = records.find((r) => (a.email && r.email === a.email) || (r.fullName && sameName(nameKey(r.fullName), a.key) && r.dob === a.dob));
+    if (twin) continue;
+    records.push(build(null, a, null));
+  }
+
+  records.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || ""));
+  writeFileSync(path.join(OUT, "candidates.json"), JSON.stringify(records, null, 2));
+  if (READ_IDS) writeFileSync(path.join(OUT, "id-data.json"), JSON.stringify(idData, null, 2));
+
+  const order = { high: 0, medium: 1, "no files": 2, "not matched": 3, "not matched (left out)": 4 };
+  report.sort((x, y) => order[x.sure] - order[y.sure] || (x.c.fullName || "~").localeCompare(y.c.fullName || "~"));
+  writeFileSync(
+    path.join(OUT, "rebuild-report.csv"),
+    [
+      "How sure,Name,Email,Candidate ID,Status,Files,Matched by,Score",
+      ...report.map((r) =>
+        [r.sure, r.c.fullName || "(unknown)", r.c.email, r.c.id, r.c.status, (r.c.documents ?? []).length, r.why, r.score].map(cell).join(","),
+      ),
+    ].join("\r\n"),
+  );
+
+  const count = (s) => report.filter((r) => r.sure === s).length;
+  console.log(
+    `\nDone. ${records.length} candidates in recovered/candidates.json:\n` +
+      `  ${count("high")} matched for sure, ${count("medium")} probably right (check),\n` +
+      `  ${count("not matched")} with files but no Telegram match (check), ${count("no files")} from Telegram only.\n` +
+      `  ${count("not matched (left out)")} folders with no name were left out (add --include-unnamed to keep them).\n` +
+      `See recovered/rebuild-report.csv.`,
+  );
+}
+
+main().catch((e) => {
+  const code = e?.name || e?.Code || "";
+  if (code === "InvalidAccessKeyId" || code === "SignatureDoesNotMatch" || e?.$metadata?.httpStatusCode === 403) {
+    console.error("R2 refused the keys. Check R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY.");
+  } else if (code === "NoSuchBucket") {
+    console.error(`There is no bucket named "${BUCKET}". Check R2_BUCKET.`);
+  } else {
+    console.error(`Something went wrong: ${e?.stack || e?.message || e}`);
+  }
+  process.exit(1);
+});
