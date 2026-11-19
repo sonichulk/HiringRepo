@@ -412,7 +412,14 @@ async function idReader() {
     console.error("The English OCR data is missing. Run:\n  npm install --no-save @tesseract.js-data/eng");
     process.exit(1);
   }
-  const worker = await tesseract.createWorker("eng", 1, { langPath, gzip: true, cachePath: path.join(OUT, ".ocr-cache") });
+  // debug_file: the reader's own notes ("Image too small to scale", "Line
+  // cannot be recognized") are about non-text shapes it skips — not errors.
+  const worker = await tesseract.createWorker(
+    "eng",
+    1,
+    { langPath, gzip: true, cachePath: path.join(OUT, ".ocr-cache") },
+    { debug_file: "/dev/null" },
+  );
   await worker.setParameters({
     tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<",
     tessedit_pageseg_mode: tesseract.PSM.SINGLE_BLOCK,
@@ -481,10 +488,29 @@ async function main() {
   // What each folder says about its owner.
   const ids = READ_IDS ? await idReader() : null;
   const idData = [];
+  // IDs already read on an earlier run, so a stopped run carries on where it was.
+  const CACHE = path.join(OUT, "id-cache.json");
+  let idCache = {};
+  try {
+    if (ids) idCache = JSON.parse(readFileSync(CACHE, "utf8"));
+  } catch {
+    idCache = {};
+  }
+  const saveCache = () => ids && writeFileSync(CACHE, JSON.stringify(idCache));
+  if (ids && Object.keys(idCache).length) console.log(`${Object.keys(idCache).length} ID photos already read on an earlier run: skipping them.`);
+  const started = Date.now();
   let n = 0;
   for (const f of folders.values()) {
     n++;
-    if (process.stdout.isTTY && (n % 5 === 0 || n === folders.size)) process.stdout.write(`\rReading agreements${ids ? " and IDs" : ""}… ${n} of ${folders.size}`);
+    const label = `Reading agreements${ids ? " and IDs" : ""}… ${n} of ${folders.size}`;
+    if (process.stdout.isTTY) {
+      if (n % 5 === 0 || n === folders.size) process.stdout.write(`\r${label}`);
+    } else if (n % 25 === 0 || n === folders.size) {
+      const mins = (Date.now() - started) / 60000;
+      const left = Math.round((mins / n) * (folders.size - n));
+      console.log(`${label} (${Math.round(mins)} min so far, about ${left} min left)`);
+    }
+    if (ids && n % 10 === 0) saveCache();
     f.files.sort((a, b) => a.at.localeCompare(b.at));
     const newest = (kind) => f.files.filter((x) => x.kind === kind).at(-1);
     const appTimes = f.files.filter((x) => APPLICATION_KINDS.has(x.kind)).map((x) => x.at);
@@ -508,7 +534,13 @@ async function main() {
       for (const kind of ["identity", "identityBack"]) {
         const img = newest(kind);
         if (!img || !IMAGE.test(img.file)) continue;
-        const got = await ids.read(await getBytes(img.key)).catch(() => null);
+        let got = idCache[img.key];
+        if (got === undefined) {
+          got = await getBytes(img.key)
+            .then((bytes) => ids.read(bytes))
+            .catch(() => null);
+          idCache[img.key] = got ?? null;
+        }
         if (got) {
           f.mrz = got;
           break;
@@ -518,7 +550,10 @@ async function main() {
     }
   }
   if (process.stdout.isTTY) process.stdout.write("\n");
-  if (ids) await ids.close();
+  if (ids) {
+    saveCache();
+    await ids.close();
+  }
 
   // ---- matching: score every (folder, application) pair, best pairs first.
   const byEmail = new Map();
