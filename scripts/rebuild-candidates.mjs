@@ -397,7 +397,7 @@ function parseMrz(text) {
   return null;
 }
 
-async function idReader() {
+async function idReader(count) {
   let tesseract;
   let sharp;
   try {
@@ -412,44 +412,64 @@ async function idReader() {
     console.error("The English OCR data is missing. Run:\n  npm install --no-save @tesseract.js-data/eng");
     process.exit(1);
   }
+  // One reader per processor core, each reading a different photo.
   // debug_file: the reader's own notes ("Image too small to scale", "Line
   // cannot be recognized") are about non-text shapes it skips — not errors.
-  const worker = await tesseract.createWorker(
-    "eng",
-    1,
-    { langPath, gzip: true, cachePath: path.join(OUT, ".ocr-cache") },
-    { debug_file: "/dev/null" },
-  );
-  await worker.setParameters({
-    tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<",
-    tessedit_pageseg_mode: tesseract.PSM.SINGLE_BLOCK,
-  });
+  const free = [];
+  for (let i = 0; i < count; i++) {
+    const worker = await tesseract.createWorker(
+      "eng",
+      1,
+      { langPath, gzip: true, cachePath: path.join(OUT, ".ocr-cache") },
+      { debug_file: "/dev/null" },
+    );
+    await worker.setParameters({
+      tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<",
+      tessedit_pageseg_mode: tesseract.PSM.SINGLE_BLOCK,
+    });
+    free.push(worker);
+  }
+  const all = [...free];
+  const waiting = [];
+  const take = () => (free.length ? Promise.resolve(free.pop()) : new Promise((r) => waiting.push(r)));
+  const give = (w) => (waiting.length ? waiting.shift()(w) : free.push(w));
+
   return {
     async read(bytes) {
-      // Upright from the camera's own note, grey, larger; then the lower half
-      // alone (where the lines are), and the whole thing turned, for photos
-      // taken sideways or upside down.
-      const base = sharp(bytes, { failOn: "none" }).rotate().grayscale().normalise();
-      const meta = await base.clone().resize({ width: 2400, withoutEnlargement: false }).toBuffer({ resolveWithObject: true });
+      // Upright from the camera's own note, grey, larger. The lower half first
+      // (where the lines are), then the whole photo; then turned — sideways
+      // for a photo taller than wide, upside down otherwise.
+      const meta = await sharp(bytes, { failOn: "none" })
+        .rotate()
+        .grayscale()
+        .normalise()
+        .resize({ width: 1800 })
+        .toBuffer({ resolveWithObject: true });
+      const { width, height } = meta.info;
       const tries = [
-        () => sharp(meta.data).extract({ left: 0, top: Math.floor(meta.info.height * 0.5), width: meta.info.width, height: Math.ceil(meta.info.height * 0.5) }).toBuffer(),
+        () => sharp(meta.data).extract({ left: 0, top: Math.floor(height * 0.5), width, height: Math.ceil(height * 0.5) }).toBuffer(),
         () => Promise.resolve(meta.data),
-        () => sharp(meta.data).rotate(180).toBuffer(),
-        () => sharp(meta.data).rotate(90).toBuffer(),
-        () => sharp(meta.data).rotate(270).toBuffer(),
+        ...(height > width
+          ? [() => sharp(meta.data).rotate(90).toBuffer(), () => sharp(meta.data).rotate(270).toBuffer()]
+          : [() => sharp(meta.data).rotate(180).toBuffer()]),
       ];
-      for (const t of tries) {
-        try {
-          const { data } = await worker.recognize(await t());
-          const found = parseMrz(data.text);
-          if (found) return found;
-        } catch {
-          /* next way round */
+      const worker = await take();
+      try {
+        for (const t of tries) {
+          try {
+            const { data } = await worker.recognize(await t());
+            const found = parseMrz(data.text);
+            if (found) return found;
+          } catch {
+            /* next way round */
+          }
         }
+        return null;
+      } finally {
+        give(worker);
       }
-      return null;
     },
-    close: () => worker.terminate(),
+    close: () => Promise.all(all.map((w) => w.terminate())),
   };
 }
 
@@ -485,32 +505,12 @@ async function main() {
   }
   console.log(`R2: ${folders.size} candidate folders.`);
 
-  // What each folder says about its owner.
-  const ids = READ_IDS ? await idReader() : null;
-  const idData = [];
-  // IDs already read on an earlier run, so a stopped run carries on where it was.
-  const CACHE = path.join(OUT, "id-cache.json");
-  let idCache = {};
-  try {
-    if (ids) idCache = JSON.parse(readFileSync(CACHE, "utf8"));
-  } catch {
-    idCache = {};
-  }
-  const saveCache = () => ids && writeFileSync(CACHE, JSON.stringify(idCache));
-  if (ids && Object.keys(idCache).length) console.log(`${Object.keys(idCache).length} ID photos already read on an earlier run: skipping them.`);
+  // What each folder says about its owner: first the agreements (quick)…
   const started = Date.now();
   let n = 0;
   for (const f of folders.values()) {
     n++;
-    const label = `Reading agreements${ids ? " and IDs" : ""}… ${n} of ${folders.size}`;
-    if (process.stdout.isTTY) {
-      if (n % 5 === 0 || n === folders.size) process.stdout.write(`\r${label}`);
-    } else if (n % 25 === 0 || n === folders.size) {
-      const mins = (Date.now() - started) / 60000;
-      const left = Math.round((mins / n) * (folders.size - n));
-      console.log(`${label} (${Math.round(mins)} min so far, about ${left} min left)`);
-    }
-    if (ids && n % 10 === 0) saveCache();
+    if (process.stdout.isTTY && (n % 5 === 0 || n === folders.size)) process.stdout.write(`\rReading agreements… ${n} of ${folders.size}`);
     f.files.sort((a, b) => a.at.localeCompare(b.at));
     const newest = (kind) => f.files.filter((x) => x.kind === kind).at(-1);
     const appTimes = f.files.filter((x) => APPLICATION_KINDS.has(x.kind)).map((x) => x.at);
@@ -530,12 +530,41 @@ async function main() {
         }
       }
     }
-    if (ids) {
-      for (const kind of ["identity", "identityBack"]) {
-        const img = newest(kind);
-        if (!img || !IMAGE.test(img.file)) continue;
+    // The back of an ID card carries the lines; a passport has them on the front.
+    f.idImages = ["identityBack", "identity"].map(newest).filter((x) => x && IMAGE.test(x.file));
+  }
+  if (process.stdout.isTTY) process.stdout.write("\n");
+  console.log(`Agreements read in ${Math.max(1, Math.round((Date.now() - started) / 60000))} min.`);
+
+  // …then the IDs, several at a time. Each one read is remembered in
+  // id-cache.json, so a stopped run carries on where it was.
+  const idData = [];
+  if (READ_IDS) {
+    const CACHE = path.join(OUT, "id-cache.json");
+    let idCache = {};
+    try {
+      idCache = JSON.parse(readFileSync(CACHE, "utf8"));
+    } catch {
+      idCache = {};
+    }
+    const saveCache = () => writeFileSync(CACHE, JSON.stringify(idCache));
+    const todo = [...folders.values()].filter((f) => f.idImages.length);
+    const done0 = todo.filter((f) => f.idImages.every((x) => x.key in idCache)).length;
+    const cores = Math.max(1, Math.min(8, (await import("node:os")).availableParallelism?.() ?? 2));
+    console.log(
+      `Reading the IDs of ${todo.length} candidates with ${cores} readers at once` +
+        (done0 ? ` (${done0} already read on an earlier run: skipped).` : "."),
+    );
+    const ids = await idReader(cores);
+    const t0 = Date.now();
+    let finished = 0;
+    let fresh = 0;
+    const one = async (f) => {
+      let didRead = false;
+      for (const img of f.idImages) {
         let got = idCache[img.key];
         if (got === undefined) {
+          didRead = true;
           got = await getBytes(img.key)
             .then((bytes) => ids.read(bytes))
             .catch(() => null);
@@ -546,13 +575,28 @@ async function main() {
           break;
         }
       }
-      idData.push({ candidateId: f.id, ...(f.mrz ?? { read: false }) });
-    }
-  }
-  if (process.stdout.isTTY) process.stdout.write("\n");
-  if (ids) {
+      finished++;
+      if (didRead) fresh++;
+      if (didRead && fresh % 10 === 0) saveCache();
+      if (finished % 25 === 0 || finished === todo.length) {
+        const mins = (Date.now() - t0) / 60000;
+        const per = fresh ? mins / fresh : 0;
+        const left = Math.round(per * (todo.length - finished));
+        const line = `Reading IDs… ${finished} of ${todo.length} (${Math.round(mins)} min so far, about ${left} min left)`;
+        if (process.stdout.isTTY) process.stdout.write(`\r${line}   `);
+        else console.log(line);
+      }
+    };
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: cores }, async () => {
+        while (next < todo.length) await one(todo[next++]);
+      }),
+    );
+    if (process.stdout.isTTY) process.stdout.write("\n");
     saveCache();
     await ids.close();
+    for (const f of folders.values()) idData.push({ candidateId: f.id, ...(f.mrz ?? { read: false }) });
   }
 
   // ---- matching: score every (folder, application) pair, best pairs first.
