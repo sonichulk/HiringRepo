@@ -112,9 +112,25 @@ async function listAll(prefix) {
   return out;
 }
 
+/** A promise that gives up after `ms`, so one stuck file cannot stop the whole run. */
+function withTimeout(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("timeout")), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 async function getBytes(key) {
-  const res = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
-  return Buffer.from(await res.Body.transformToByteArray());
+  return withTimeout(
+    (async () => {
+      const res = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }), { abortSignal: AbortSignal.timeout(120_000) });
+      return Buffer.from(await res.Body.transformToByteArray());
+    })(),
+    120_000,
+  );
 }
 
 // ------------------------------------------------------------------ helpers
@@ -403,6 +419,9 @@ async function idReader(count) {
   try {
     tesseract = await import("tesseract.js");
     sharp = (await import("sharp")).default;
+    // Less memory: one photo decoded at a time per reader, nothing kept around.
+    sharp.cache(false);
+    sharp.concurrency(1);
   } catch {
     console.error("To read IDs, first run:\n  npm install --no-save tesseract.js@5 @tesseract.js-data/eng");
     process.exit(1);
@@ -415,8 +434,7 @@ async function idReader(count) {
   // One reader per processor core, each reading a different photo.
   // debug_file: the reader's own notes ("Image too small to scale", "Line
   // cannot be recognized") are about non-text shapes it skips — not errors.
-  const free = [];
-  for (let i = 0; i < count; i++) {
+  const makeWorker = async () => {
     const worker = await tesseract.createWorker(
       "eng",
       1,
@@ -427,9 +445,11 @@ async function idReader(count) {
       tessedit_char_whitelist: "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<",
       tessedit_pageseg_mode: tesseract.PSM.SINGLE_BLOCK,
     });
-    free.push(worker);
-  }
-  const all = [...free];
+    return worker;
+  };
+  const free = [];
+  for (let i = 0; i < count; i++) free.push(await makeWorker());
+  const all = new Set(free);
   const waiting = [];
   const take = () => (free.length ? Promise.resolve(free.pop()) : new Promise((r) => waiting.push(r)));
   const give = (w) => (waiting.length ? waiting.shift()(w) : free.push(w));
@@ -439,12 +459,10 @@ async function idReader(count) {
       // Upright from the camera's own note, grey, larger. The lower half first
       // (where the lines are), then the whole photo; then turned — sideways
       // for a photo taller than wide, upside down otherwise.
-      const meta = await sharp(bytes, { failOn: "none" })
-        .rotate()
-        .grayscale()
-        .normalise()
-        .resize({ width: 1800 })
-        .toBuffer({ resolveWithObject: true });
+      const meta = await withTimeout(
+        sharp(bytes, { failOn: "none" }).rotate().grayscale().normalise().resize({ width: 1800 }).toBuffer({ resolveWithObject: true }),
+        60_000,
+      );
       const { width, height } = meta.info;
       const tries = [
         () => sharp(meta.data).extract({ left: 0, top: Math.floor(height * 0.5), width, height: Math.ceil(height * 0.5) }).toBuffer(),
@@ -453,15 +471,24 @@ async function idReader(count) {
           ? [() => sharp(meta.data).rotate(90).toBuffer(), () => sharp(meta.data).rotate(270).toBuffer()]
           : [() => sharp(meta.data).rotate(180).toBuffer()]),
       ];
-      const worker = await take();
+      let worker = await take();
       try {
         for (const t of tries) {
           try {
-            const { data } = await worker.recognize(await t());
+            const { data } = await withTimeout(
+              t().then((img) => worker.recognize(img)),
+              60_000,
+            );
             const found = parseMrz(data.text);
             if (found) return found;
-          } catch {
-            /* next way round */
+          } catch (e) {
+            if (e?.message !== "timeout") continue; // next way round
+            // Stuck on this photo: replace the reader and give the photo up.
+            all.delete(worker);
+            void worker.terminate().catch(() => {});
+            worker = await makeWorker();
+            all.add(worker);
+            throw e;
           }
         }
         return null;
@@ -469,7 +496,7 @@ async function idReader(count) {
         give(worker);
       }
     },
-    close: () => Promise.all(all.map((w) => w.terminate())),
+    close: () => Promise.all([...all].map((w) => w.terminate().catch(() => {}))),
   };
 }
 
@@ -559,6 +586,12 @@ async function main() {
     const t0 = Date.now();
     let finished = 0;
     let fresh = 0;
+    let skipped = 0;
+    // A sign of life every five minutes, even when no 25 have finished.
+    const heartbeat = setInterval(() => {
+      console.log(`Still working: ${finished} of ${todo.length} done (${Math.round((Date.now() - t0) / 60000)} min so far).`);
+    }, 5 * 60_000);
+    heartbeat.unref();
     const one = async (f) => {
       let didRead = false;
       for (const img of f.idImages) {
@@ -567,7 +600,13 @@ async function main() {
           didRead = true;
           got = await getBytes(img.key)
             .then((bytes) => ids.read(bytes))
-            .catch(() => null);
+            .catch((e) => {
+              if (e?.message === "timeout") {
+                skipped++;
+                console.log(`Skipped one ID photo that took too long (candidate ${f.id}).`);
+              }
+              return null;
+            });
           idCache[img.key] = got ?? null;
         }
         if (got) {
@@ -593,7 +632,9 @@ async function main() {
         while (next < todo.length) await one(todo[next++]);
       }),
     );
+    clearInterval(heartbeat);
     if (process.stdout.isTTY) process.stdout.write("\n");
+    if (skipped) console.log(`${skipped} ID photos were skipped because they took too long; the other evidence is still used for them.`);
     saveCache();
     await ids.close();
     for (const f of folders.values()) idData.push({ candidateId: f.id, ...(f.mrz ?? { read: false }) });
