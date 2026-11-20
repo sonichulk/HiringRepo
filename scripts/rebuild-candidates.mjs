@@ -671,6 +671,54 @@ async function main() {
     return one ? [one] : [];
   };
 
+  // The "has just submitted the application form" message is sent the moment
+  // the form's own files (CV, cover letter, certificate) finish uploading —
+  // seconds after the last of them. A folder and such a message belong
+  // together only when each is the other's only possibility: when two people
+  // finish in the same moment, timing cannot tell them apart, and it is not
+  // guessed.
+  {
+    const BEFORE = 3_000;
+    const AFTER = 20_000;
+    const forFolder = new Map();
+    const forMessage = new Map();
+    for (const f of folders.values()) {
+      const ups = f.files.filter((x) => APPLICATION_KINDS.has(x.kind)).map((x) => ms(x.at));
+      if (!ups.length) continue;
+      const last = Math.max(...ups);
+      for (const sm of tg.submitted) {
+        const gap = ms(sm.at) - last;
+        if (gap < -BEFORE || gap > AFTER) continue;
+        if (!forFolder.has(f.id)) forFolder.set(f.id, []);
+        forFolder.get(f.id).push(sm);
+        if (!forMessage.has(sm)) forMessage.set(sm, []);
+        forMessage.get(sm).push(f.id);
+      }
+    }
+    // Settle the certain pairs, take them out, and look again: a message
+    // that is surely A's is no longer a possibility for B — like a sudoku.
+    const settled = new Map(); // folder id -> message
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const [fid, list] of forFolder) {
+        if (settled.has(fid)) continue;
+        const open = list.filter((sm) => ![...settled.values()].includes(sm));
+        if (open.length !== 1) continue;
+        const rivals = forMessage.get(open[0]).filter((id) => id !== fid && !settled.has(id));
+        if (rivals.length) continue;
+        settled.set(fid, open[0]);
+        changed = true;
+      }
+    }
+    for (const f of folders.values()) {
+      const list = forFolder.get(f.id);
+      if (!list) continue;
+      const sure = settled.get(f.id);
+      f.submitted = sure ? { list: [sure], clear: true } : { list, clear: false };
+    }
+  }
+
   const pairs = [];
   for (const f of folders.values()) {
     const score = new Map();
@@ -713,22 +761,29 @@ async function main() {
       if (dobToo.length) add([pickByTime(dobToo, f)], 70, "name and date of birth on ID");
       else if (same.length) add([pickByTime(same, f)], 35, "name on ID");
     }
-    // 4. Upload times: the application form's files arrive minutes after the
-    //    personal details, so the nearest application before them is theirs.
+    // 4. The form submitted, seconds after its files: that name is the owner.
+    if (f.submitted) {
+      for (const sm of f.submitted.list) {
+        const same = tg.applications.filter((a) => sameName(a.key, sm.key) && ms(a.at) <= ms(sm.at));
+        if (!same.length) continue;
+        add(
+          [pickByTime(same, f)],
+          f.submitted.clear ? 80 : 10,
+          f.submitted.clear ? "form submitted right after the CV upload" : "form submitted near the CV upload (someone else too)",
+        );
+      }
+    }
+    // 5. Only one application started in the hours before the upload: theirs.
+    //    (With others close by, the nearest is often someone else, so it
+    //    counts for little.)
     if (f.firstUpload) {
       const t = ms(f.firstUpload);
       const near = tg.applications
         .map((a) => ({ a, gap: t - ms(a.at) }))
-        .filter((x) => x.gap >= -2 * MIN && x.gap <= 12 * HOUR)
+        .filter((x) => x.gap >= -2 * MIN && x.gap <= 3 * HOUR)
         .sort((x, y) => x.gap - y.gap);
-      if (near.length) {
-        const close = near.filter((x) => x.gap - near[0].gap <= 15 * MIN);
-        add(close.map((x) => x.a), close.length === 1 ? 35 : 15, close.length === 1 ? "upload time" : "upload time (others close too)");
-        const lastT = ms(f.lastAppUpload);
-        for (const { a } of close) {
-          if (tg.submitted.some((s) => sameName(s.key, a.key) && within(s.at, lastT - 5 * MIN, lastT + 6 * HOUR))) add([a], 10, "form submitted after the uploads");
-        }
-      }
+      if (near.length === 1) add([near[0].a], 35, "only application at the time of the upload");
+      else if (near.length) add([near[0].a], 5, "upload time");
     }
     for (const [appN, s] of score) pairs.push({ f, a: tg.applications[appN], pts: s.pts, why: s.why });
   }
@@ -914,6 +969,18 @@ async function main() {
   );
 
   const count = (s) => report.filter((r) => r.sure === s).length;
+  // Counts only, no names: why folders were or were not matched, to look into.
+  const all = [...folders.values()];
+  const withForm = all.filter((f) => f.files.some((x) => APPLICATION_KINDS.has(x.kind)));
+  console.log(
+    `\nFolders: ${all.length}; with a CV or other form file: ${withForm.length}; ` +
+      `linked for sure to a "submitted" message: ${all.filter((f) => f.submitted?.clear).length}; ` +
+      `several possible: ${all.filter((f) => f.submitted && !f.submitted.clear).length}; ` +
+      `none within 20 seconds: ${withForm.filter((f) => !f.submitted).length}.`,
+  );
+  const firstMsg = [...tg.applications, ...tg.submitted].map((x) => x.at).sort()[0] ?? "";
+  const beforeTelegram = withForm.filter((f) => f.lastAppUpload && f.lastAppUpload < firstMsg).length;
+  if (beforeTelegram) console.log(`${beforeTelegram} folders have files from before the first Telegram message (${firstMsg.slice(0, 10)}).`);
   console.log(
     `\nDone. ${records.length} candidates in recovered/candidates.json:\n` +
       `  ${count("high")} matched for sure, ${count("medium")} probably right (check),\n` +
