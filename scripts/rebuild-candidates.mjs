@@ -757,6 +757,55 @@ async function main() {
       if (settled.has(f.id)) f.submitted = { list: [settled.get(f.id)], clear: true };
       else if (possible.get(f.id)?.length) f.submitted = { list: possible.get(f.id), clear: false };
     }
+    // The interview page asks for the ID photos the moment the assessment is
+    // scored, and "Interview completed" (name, email) is sent at that moment:
+    // the photos follow it within minutes. Same rule: only when certain.
+    {
+      const ID_KINDS = new Set(["identity", "identityBack", "selfie"]);
+      const firstId = new Map();
+      for (const f of folders.values()) {
+        const t = f.files.filter((x) => ID_KINDS.has(x.kind)).map((x) => ms(x.at));
+        if (t.length) firstId.set(f.id, Math.min(...t));
+      }
+      const doneF = new Map(); // folder id -> interview message
+      const doneM = new Set();
+      const maybeI = new Map();
+      for (const WINDOW of [15 * MIN, 60 * MIN]) {
+        const forFolder = new Map();
+        const forMessage = new Map();
+        for (const [fid, up] of firstId) {
+          if (doneF.has(fid)) continue;
+          for (const iv of tg.interviews) {
+            if (doneM.has(iv) || !iv.email) continue;
+            const gap = up - ms(iv.at);
+            if (gap < -MIN || gap > WINDOW) continue;
+            if (!forFolder.has(fid)) forFolder.set(fid, []);
+            forFolder.get(fid).push(iv);
+            if (!forMessage.has(iv)) forMessage.set(iv, []);
+            forMessage.get(iv).push(fid);
+          }
+        }
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const [fid, list] of forFolder) {
+            if (doneF.has(fid)) continue;
+            const open = list.filter((iv) => !doneM.has(iv));
+            if (open.length !== 1) continue;
+            if (forMessage.get(open[0]).some((id) => id !== fid && !doneF.has(id))) continue;
+            doneF.set(fid, open[0]);
+            doneM.add(open[0]);
+            changed = true;
+          }
+        }
+        for (const [fid, list] of forFolder) if (!doneF.has(fid)) maybeI.set(fid, list.filter((iv) => !doneM.has(iv)));
+      }
+      for (const f of folders.values()) {
+        if (doneF.has(f.id)) f.interviewLink = { list: [doneF.get(f.id)], clear: true };
+        else if (maybeI.get(f.id)?.length) f.interviewLink = { list: maybeI.get(f.id), clear: false };
+      }
+    }
+
     // For the diagnosis: how far the nearest message was from each folder left without one.
     for (const [fid, last] of lastForm) {
       const f = folders.get(fid);
@@ -812,6 +861,16 @@ async function main() {
       if (dobToo.length) add([pickByTime(dobToo, f)], 70, "name and date of birth on ID");
       else if (same.length === 1) add(same, 40, "name on ID");
       else if (same.length) add([pickByTime(same, f)], 10, "name on ID (shared by others)");
+    }
+    // 4b. ID photos uploaded minutes after "Interview completed": that email is the owner.
+    if (f.interviewLink) {
+      for (const iv of f.interviewLink.list) {
+        add(
+          appsFor(iv.email, iv.key, f),
+          f.interviewLink.clear ? 80 : 10,
+          f.interviewLink.clear ? "ID uploaded right after their interview" : "ID uploaded after an interview (someone else's too)",
+        );
+      }
     }
     // 4. The form submitted, seconds after its files: that name is the owner.
     if (f.submitted) {
@@ -1025,7 +1084,11 @@ async function main() {
   const all = [...folders.values()];
   const withForm = all.filter((f) => f.files.some((x) => APPLICATION_KINDS.has(x.kind)));
   console.log(
-    `\nFolders: ${all.length}; with a CV or other form file: ${withForm.length}; ` +
+    `\nID photos linked for sure to an "Interview completed" message: ${all.filter((f) => f.interviewLink?.clear).length}; ` +
+      `several possible: ${all.filter((f) => f.interviewLink && !f.interviewLink.clear).length}.`,
+  );
+  console.log(
+    `Folders: ${all.length}; with a CV or other form file: ${withForm.length}; ` +
       `linked for sure to a "submitted" message: ${all.filter((f) => f.submitted?.clear).length}; ` +
       `several possible: ${all.filter((f) => f.submitted && !f.submitted.clear).length}; ` +
       `none within 3 minutes: ${withForm.filter((f) => !f.submitted).length}.`,
