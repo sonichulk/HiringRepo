@@ -216,13 +216,15 @@ function readTelegram(file) {
   const chats = Array.isArray(data?.messages) ? [data] : (data?.chats?.list ?? []);
   const messages = chats.flatMap((c) => c.messages ?? []).filter((m) => m?.type === "message");
 
-  const t = { applications: [], submitted: [], interviews: [], addresses: [], signed: [] };
+  const t = { applications: [], submitted: [], interviews: [], addresses: [], signed: [], later: 0 };
+  const people = []; // name + email from any later message about a candidate
   for (const m of messages) {
     const text = messageText(m);
     const at = m.date_unixtime ? new Date(Number(m.date_unixtime) * 1000).toISOString() : new Date(m.date).toISOString();
     const f = fieldsOf(text);
     const email = (f.email || "").toLowerCase();
     const name = f.name || "";
+    if (name && email && !text.includes("New contact message")) people.push({ at, name, email, country: f.country || "" });
 
     if (text.includes("New application — Personal information")) {
       const firstName = f["first name"] || "";
@@ -269,6 +271,36 @@ function readTelegram(file) {
     if (text.includes("Signed agreement received") || text.includes("New signed agreement received")) {
       t.signed.push({ at, key: nameKey(name), email, ref: (f.agreement || "").trim().toUpperCase() });
     }
+  }
+  // Candidates whose application messages were never sent (the site's quiet
+  // mode skipped them for ID-check countries) still appear in later messages
+  // — interview completed, live ID check, chat, address, agreement — with
+  // their name, email and country. They become applications too, without
+  // the details only the form had.
+  const known = new Set(t.applications.map((a) => a.email).filter(Boolean));
+  people.sort((x, y) => x.at.localeCompare(y.at));
+  for (const p of people) {
+    if (known.has(p.email)) continue;
+    known.add(p.email);
+    const words = p.name.trim().split(/\s+/);
+    t.applications.push({
+      n: t.applications.length,
+      at: p.at,
+      firstName: words.length > 1 ? words.slice(0, -1).join(" ") : words[0],
+      lastName: words.length > 1 ? words.at(-1) : "",
+      fullName: p.name.trim(),
+      key: nameKey(p.name),
+      dob: "",
+      dobRaw: "",
+      email: p.email,
+      phone: "",
+      country: p.country,
+      city: "",
+      address: "",
+      linkedin: "",
+      later: true,
+    });
+    t.later++;
   }
   return t;
 }
@@ -514,7 +546,8 @@ async function main() {
   mkdirSync(OUT, { recursive: true });
   const tg = readTelegram(TELEGRAM);
   console.log(
-    `Telegram: ${tg.applications.length} applications, ${tg.interviews.length} interviews, ` +
+    `Telegram: ${tg.applications.length - tg.later} applications (+${tg.later} people known only from later messages), ` +
+      `${tg.submitted.length} "submitted" messages, ${tg.interviews.length} interviews, ` +
       `${tg.addresses.length} proofs of address, ${tg.signed.length} signed agreements.`,
   );
   if (!tg.applications.length) {
@@ -678,44 +711,62 @@ async function main() {
   // finish in the same moment, timing cannot tell them apart, and it is not
   // guessed.
   {
-    const BEFORE = 3_000;
-    const AFTER = 20_000;
-    const forFolder = new Map();
-    const forMessage = new Map();
+    const lastForm = new Map();
     for (const f of folders.values()) {
       const ups = f.files.filter((x) => APPLICATION_KINDS.has(x.kind)).map((x) => ms(x.at));
-      if (!ups.length) continue;
-      const last = Math.max(...ups);
-      for (const sm of tg.submitted) {
-        const gap = ms(sm.at) - last;
-        if (gap < -BEFORE || gap > AFTER) continue;
-        if (!forFolder.has(f.id)) forFolder.set(f.id, []);
-        forFolder.get(f.id).push(sm);
-        if (!forMessage.has(sm)) forMessage.set(sm, []);
-        forMessage.get(sm).push(f.id);
-      }
+      if (ups.length) lastForm.set(f.id, Math.max(...ups));
     }
-    // Settle the certain pairs, take them out, and look again: a message
-    // that is surely A's is no longer a possibility for B — like a sudoku.
     const settled = new Map(); // folder id -> message
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const [fid, list] of forFolder) {
+    const taken = new Set();
+    const possible = new Map(); // folder id -> messages, for the ones left open
+    // First within 20 seconds; then, for what is left, within 3 minutes — a
+    // large CV on a slow phone starts uploading well before it finishes.
+    for (const AFTER of [20_000, 3 * MIN]) {
+      const forFolder = new Map();
+      const forMessage = new Map();
+      for (const [fid, last] of lastForm) {
         if (settled.has(fid)) continue;
-        const open = list.filter((sm) => ![...settled.values()].includes(sm));
-        if (open.length !== 1) continue;
-        const rivals = forMessage.get(open[0]).filter((id) => id !== fid && !settled.has(id));
-        if (rivals.length) continue;
-        settled.set(fid, open[0]);
-        changed = true;
+        for (const sm of tg.submitted) {
+          if (taken.has(sm)) continue;
+          const gap = ms(sm.at) - last;
+          if (gap < -3_000 || gap > AFTER) continue;
+          if (!forFolder.has(fid)) forFolder.set(fid, []);
+          forFolder.get(fid).push(sm);
+          if (!forMessage.has(sm)) forMessage.set(sm, []);
+          forMessage.get(sm).push(fid);
+        }
       }
+      // Settle the certain pairs, take them out, and look again: a message
+      // that is surely A's is no longer a possibility for B — like a sudoku.
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const [fid, list] of forFolder) {
+          if (settled.has(fid)) continue;
+          const open = list.filter((sm) => !taken.has(sm));
+          if (open.length !== 1) continue;
+          if (forMessage.get(open[0]).some((id) => id !== fid && !settled.has(id))) continue;
+          settled.set(fid, open[0]);
+          taken.add(open[0]);
+          changed = true;
+        }
+      }
+      for (const [fid, list] of forFolder) if (!settled.has(fid)) possible.set(fid, list.filter((sm) => !taken.has(sm)));
     }
     for (const f of folders.values()) {
-      const list = forFolder.get(f.id);
-      if (!list) continue;
-      const sure = settled.get(f.id);
-      f.submitted = sure ? { list: [sure], clear: true } : { list, clear: false };
+      if (settled.has(f.id)) f.submitted = { list: [settled.get(f.id)], clear: true };
+      else if (possible.get(f.id)?.length) f.submitted = { list: possible.get(f.id), clear: false };
+    }
+    // For the diagnosis: how far the nearest message was from each folder left without one.
+    for (const [fid, last] of lastForm) {
+      const f = folders.get(fid);
+      if (f.submitted) continue;
+      let best = Infinity;
+      for (const sm of tg.submitted) {
+        const gap = ms(sm.at) - last;
+        if (Math.abs(gap) < Math.abs(best)) best = gap;
+      }
+      f.nearestSubmitted = best;
     }
   }
 
@@ -752,14 +803,15 @@ async function main() {
     const docName = nameKey(f.agreement?.name || f.signedName || "");
     if (docName) {
       const same = tg.applications.filter((a) => sameName(a.key, docName));
-      add(same.length ? [pickByTime(same, f)] : [], same.length === 1 ? 50 : 30, "name on agreement");
+      add(same.length ? [pickByTime(same, f)] : [], same.length === 1 ? 50 : 15, same.length === 1 ? "name on agreement" : "name on agreement (shared by others)");
     }
     if (f.mrz) {
       const idName = nameKey(`${f.mrz.firstName} ${f.mrz.lastName}`);
       const same = tg.applications.filter((a) => sameName(a.key, idName));
       const dobToo = same.filter((a) => f.mrz.dateOfBirth && a.dob === f.mrz.dateOfBirth);
       if (dobToo.length) add([pickByTime(dobToo, f)], 70, "name and date of birth on ID");
-      else if (same.length) add([pickByTime(same, f)], 35, "name on ID");
+      else if (same.length === 1) add(same, 40, "name on ID");
+      else if (same.length) add([pickByTime(same, f)], 10, "name on ID (shared by others)");
     }
     // 4. The form submitted, seconds after its files: that name is the owner.
     if (f.submitted) {
@@ -976,8 +1028,17 @@ async function main() {
     `\nFolders: ${all.length}; with a CV or other form file: ${withForm.length}; ` +
       `linked for sure to a "submitted" message: ${all.filter((f) => f.submitted?.clear).length}; ` +
       `several possible: ${all.filter((f) => f.submitted && !f.submitted.clear).length}; ` +
-      `none within 20 seconds: ${withForm.filter((f) => !f.submitted).length}.`,
+      `none within 3 minutes: ${withForm.filter((f) => !f.submitted).length}.`,
   );
+  const lone = withForm.filter((f) => !f.submitted);
+  if (lone.length) {
+    const g = (lo, hi) => lone.filter((f) => f.nearestSubmitted >= lo && f.nearestSubmitted < hi).length;
+    console.log(
+      `For those, the nearest "submitted" message was: ` +
+        `before the upload: ${g(-Infinity, -3_000)}; 3–30 min after: ${g(3 * MIN, 30 * MIN)}; ` +
+        `30 min–1 day after: ${g(30 * MIN, 24 * HOUR)}; more than a day after or none: ${g(24 * HOUR, Infinity) + lone.filter((f) => f.nearestSubmitted === undefined).length}.`,
+    );
+  }
   const firstMsg = [...tg.applications, ...tg.submitted].map((x) => x.at).sort()[0] ?? "";
   const beforeTelegram = withForm.filter((f) => f.lastAppUpload && f.lastAppUpload < firstMsg).length;
   if (beforeTelegram) console.log(`${beforeTelegram} folders have files from before the first Telegram message (${firstMsg.slice(0, 10)}).`);
