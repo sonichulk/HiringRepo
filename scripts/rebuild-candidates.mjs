@@ -566,14 +566,26 @@ async function main() {
   // …then the IDs, several at a time. Each one read is remembered in
   // id-cache.json, so a stopped run carries on where it was.
   const idData = [];
-  if (READ_IDS) {
-    const CACHE = path.join(OUT, "id-cache.json");
-    let idCache = {};
-    try {
-      idCache = JSON.parse(readFileSync(CACHE, "utf8"));
-    } catch {
-      idCache = {};
+  const CACHE = path.join(OUT, "id-cache.json");
+  let idCache = {};
+  try {
+    idCache = JSON.parse(readFileSync(CACHE, "utf8"));
+  } catch {
+    idCache = {};
+  }
+  if (!READ_IDS && Object.keys(idCache).length) {
+    // No new reading, but what an earlier --ids run read is still evidence.
+    let used = 0;
+    for (const f of folders.values()) {
+      const got = f.idImages.map((x) => idCache[x.key]).find(Boolean);
+      if (got) {
+        f.mrz = got;
+        used++;
+      }
     }
+    console.log(`Using ${used} IDs read on an earlier run (no new ID reading without --ids).`);
+  }
+  if (READ_IDS) {
     const saveCache = () => writeFileSync(CACHE, JSON.stringify(idCache));
     const todo = [...folders.values()].filter((f) => f.idImages.length);
     const done0 = todo.filter((f) => f.idImages.every((x) => x.key in idCache)).length;
