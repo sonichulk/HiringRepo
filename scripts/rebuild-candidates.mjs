@@ -704,6 +704,7 @@ async function main() {
     return one ? [one] : [];
   };
 
+  const f0 = {}; // numbers for the diagnosis
   // The "has just submitted the application form" message is sent the moment
   // the form's own files (CV, cover letter, certificate) finish uploading —
   // seconds after the last of them. A folder and such a message belong
@@ -770,13 +771,50 @@ async function main() {
       const doneF = new Map(); // folder id -> interview message
       const doneM = new Set();
       const maybeI = new Map();
-      for (const WINDOW of [15 * MIN, 60 * MIN]) {
+
+      // Folders already known through the "submitted" message: their owner's
+      // email, so that person's interviews are theirs and nobody else's.
+      const knownEmail = new Map();
+      for (const f of folders.values()) {
+        if (!f.submitted?.clear) continue;
+        const sm = f.submitted.list[0];
+        const same = tg.applications.filter((a) => sameName(a.key, sm.key) && ms(a.at) <= ms(sm.at));
+        const a = same.length ? pickByTime(same, f) : null;
+        if (a?.email) knownEmail.set(f.id, a.email);
+      }
+      const ownedBy = new Map([...knownEmail].map(([fid, e]) => [e, fid]));
+      // How long people really take from "Interview completed" to the ID
+      // photos, measured on those known folders, sets the window.
+      const gaps = [];
+      for (const [fid, email] of knownEmail) {
+        const up = firstId.get(fid);
+        if (up === undefined) continue;
+        const own = tg.interviews.filter((iv) => iv.email === email).map((iv) => up - ms(iv.at)).filter((g) => g >= -MIN && g <= 24 * HOUR);
+        if (own.length) gaps.push(Math.min(...own));
+      }
+      gaps.sort((x, y) => x - y);
+      const p90 = gaps.length >= 10 ? gaps[Math.floor(gaps.length * 0.9)] : 15 * MIN;
+      const window1 = Math.min(Math.max(p90, 3 * MIN), 60 * MIN);
+      f0.idWindow = { measured: gaps.length, minutes: Math.round(window1 / MIN) };
+      for (const [fid, email] of knownEmail) {
+        const up = firstId.get(fid);
+        if (up === undefined) continue;
+        const own = tg.interviews.find((iv) => iv.email === email && up - ms(iv.at) >= -MIN && up - ms(iv.at) <= 24 * HOUR);
+        if (own) {
+          doneF.set(fid, own);
+          doneM.add(own);
+        }
+      }
+      const notOwned = (iv, fid) => !ownedBy.has(iv.email) || ownedBy.get(iv.email) === fid;
+
+      for (const WINDOW of [window1, 60 * MIN]) {
         const forFolder = new Map();
         const forMessage = new Map();
         for (const [fid, up] of firstId) {
           if (doneF.has(fid)) continue;
+          if (knownEmail.has(fid)) continue;
           for (const iv of tg.interviews) {
-            if (doneM.has(iv) || !iv.email) continue;
+            if (doneM.has(iv) || !iv.email || !notOwned(iv, fid)) continue;
             const gap = up - ms(iv.at);
             if (gap < -MIN || gap > WINDOW) continue;
             if (!forFolder.has(fid)) forFolder.set(fid, []);
@@ -801,6 +839,7 @@ async function main() {
         for (const [fid, list] of forFolder) if (!doneF.has(fid)) maybeI.set(fid, list.filter((iv) => !doneM.has(iv)));
       }
       for (const f of folders.values()) {
+        if (knownEmail.has(f.id)) continue; // already known; its interview adds nothing new
         if (doneF.has(f.id)) f.interviewLink = { list: [doneF.get(f.id)], clear: true };
         else if (maybeI.get(f.id)?.length) f.interviewLink = { list: maybeI.get(f.id), clear: false };
       }
@@ -1085,7 +1124,8 @@ async function main() {
   const withForm = all.filter((f) => f.files.some((x) => APPLICATION_KINDS.has(x.kind)));
   console.log(
     `\nID photos linked for sure to an "Interview completed" message: ${all.filter((f) => f.interviewLink?.clear).length}; ` +
-      `several possible: ${all.filter((f) => f.interviewLink && !f.interviewLink.clear).length}.`,
+      `several possible: ${all.filter((f) => f.interviewLink && !f.interviewLink.clear).length} ` +
+      `(window ${f0.idWindow?.minutes ?? "?"} min, measured on ${f0.idWindow?.measured ?? 0} known candidates).`,
   );
   console.log(
     `Folders: ${all.length}; with a CV or other form file: ${withForm.length}; ` +
