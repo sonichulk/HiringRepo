@@ -45,6 +45,7 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { GetObjectCommand, ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
 import { PDFArray, PDFDocument, PDFRawStream, decodePDFRawStream } from "pdf-lib";
+import { withVersions } from "./add-document-versions.mjs";
 
 const OUT = path.resolve("recovered");
 const MIN = 60 * 1000;
@@ -1016,7 +1017,7 @@ function readEmailLog(file, records) {
 const DOCUMENT_KINDS = new Set([
   "cv", "cover", "certificate", "identity", "identityBack", "selfie",
   "residencePermit", "residenceBack", "residenceSelfie", "voice",
-  "formation", "einLetter", "panFront", "panBack", "addressProof", "signedAgreement",
+  "w9", "formation", "einLetter", "panFront", "panBack", "addressProof", "signedAgreement",
 ]);
 const APPLICATION_KINDS = new Set(["cv", "cover", "certificate"]);
 const IMAGE = /\.(jpe?g|png|webp|heic|heif)$/i;
@@ -1587,12 +1588,15 @@ async function main() {
 
   function build(f, a, match) {
     const files = f?.files ?? [];
+    // The newest of each kind is the current one; for the kinds the site keeps
+    // every version of (ID photos, voice, PAN, company papers, address,
+    // signed agreement) the earlier ones are added as replaced versions.
     const newestKind = new Map();
-    for (const x of files) if (x.kind !== "signedAgreement" && DOCUMENT_KINDS.has(x.kind)) newestKind.set(x.kind, x);
-    const documents = [
-      ...[...newestKind.values()],
-      ...files.filter((x) => x.kind === "signedAgreement"),
-    ].map((x) => ({ kind: x.kind, filename: x.file, size: x.size, uploadedAt: x.at, key: x.key, status: "clean" }));
+    for (const x of files) if (DOCUMENT_KINDS.has(x.kind)) newestKind.set(x.kind, x);
+    const documents = withVersions(
+      [...newestKind.values()].map((x) => ({ kind: x.kind, filename: x.file, size: x.size, uploadedAt: x.at, key: x.key, status: "clean" })),
+      files,
+    ).documents;
 
     const name = a ? { firstName: a.firstName, lastName: a.lastName, fullName: a.fullName } : null;
     const titled = (s) => s.toLowerCase().replace(/(^|[\s'-])(\p{L})/gu, (_, sep, ch) => sep + ch.toUpperCase());
