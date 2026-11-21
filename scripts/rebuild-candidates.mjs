@@ -257,7 +257,7 @@ function readTelegram(file) {
   const chats = Array.isArray(data?.messages) ? [data] : (data?.chats?.list ?? []);
   const messages = chats.flatMap((c) => c.messages ?? []).filter((m) => m?.type === "message");
 
-  const t = { applications: [], submitted: [], interviews: [], addresses: [], signed: [], later: 0 };
+  const t = { applications: [], submitted: [], interviews: [], addresses: [], signed: [], offers: [], later: 0 };
   const people = []; // name + email from any later message about a candidate
   for (const m of messages) {
     const text = messageText(m);
@@ -306,6 +306,22 @@ function readTelegram(file) {
         type: ADDRESS_TYPES[(f.document || "").toLowerCase()] || "",
         address: f.now || f.address || "",
         onFile: f["on file"] && f["on file"] !== "—" ? f["on file"] : "",
+      });
+      continue;
+    }
+    // "✅ Offer accepted" / "❌ Offer declined": the name is the line after the title.
+    if (/^\s*(✅\s*)?Offer accepted/.test(text) || /^\s*(❌\s*)?Offer declined/.test(text)) {
+      const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+      const accepted = /Offer accepted/.test(lines[0]);
+      t.offers.push({
+        at,
+        accepted,
+        name: lines[1] ?? "",
+        key: nameKey(lines[1] ?? ""),
+        position: accepted && lines[2] && !/:/.test(lines[2]) ? lines[2] : "",
+        engagedAs: f["engaged as"] || "",
+        available: f.available || "",
+        reason: f.reason || "",
       });
       continue;
     }
@@ -589,6 +605,7 @@ async function main() {
   console.log(
     `Telegram: ${tg.applications.length - tg.later} applications (+${tg.later} people known only from later messages), ` +
       `${tg.submitted.length} "submitted" messages, ${tg.interviews.length} interviews, ` +
+      `${tg.offers.filter((o) => o.accepted).length} offers accepted, ${tg.offers.filter((o) => !o.accepted).length} declined, ` +
       `${tg.addresses.length} proofs of address, ${tg.signed.length} signed agreements.`,
   );
   if (!tg.applications.length) {
@@ -1203,9 +1220,12 @@ async function main() {
       const iv = latestBy(tg.interviews, a).at(-1);
       if (iv) {
         c.status = "Interview Completed";
-        notes.push(`Interview score from Telegram: ${iv.score} (${iv.at.slice(0, 10)}). Answers were not recoverable.`);
+        if (iv.correct !== null && iv.total) c.interview = { completedAt: iv.at, score: iv.correct, total: iv.total, answers: {} };
+        notes.push(`Interview completed ${iv.at.slice(0, 10)}, score ${iv.score} (from Telegram). The answers were not recoverable.`);
       }
     }
+    // The form's own files are uploaded the moment it is submitted.
+    if (!c.submittedAt && f?.lastAppUpload && files.some((x) => APPLICATION_KINDS.has(x.kind))) c.submittedAt = f.lastAppUpload;
     // Same folder, same person: the name on their ID and the one at the top
     // of their CV should agree. When they share no word, say so.
     if (f?.mrz && f.cv?.name) {
@@ -1315,6 +1335,46 @@ async function main() {
     records.push(build(null, a, null));
   }
 
+  // Offers: "Offer accepted" / "Offer declined" carry only a name, so they
+  // go to the one candidate of that name who had got that far.
+  const offerStats = { applied: 0, unsure: 0, none: 0 };
+  const stage = (r) => (r.agreementSentAt ? 4 : r.addressProofSubmittedAt ? 3 : r.interview || r.status === "Interview Completed" ? 2 : 1);
+  for (const o of [...tg.offers].sort((x, y) => x.at.localeCompare(y.at))) {
+    const same = records.filter((r) => r.fullName && sameName(nameKey(r.fullName), o.key) && (r.createdAt || "") <= o.at);
+    if (!same.length) {
+      offerStats.none++;
+      continue;
+    }
+    const best = Math.max(...same.map(stage));
+    const top = same.filter((r) => stage(r) === best);
+    const what = o.accepted ? "Offer accepted" : "Offer declined";
+    if (top.length !== 1) {
+      offerStats.unsure++;
+      for (const r of same) r.notes += `\nCheck: an "${what}" message (${o.at.slice(0, 10)}) has this name, but several candidates share it.`;
+      continue;
+    }
+    const r = top[0];
+    offerStats.applied++;
+    if (o.accepted) {
+      r.offerAcceptedAt = o.at;
+      delete r.offerDeclinedAt;
+      delete r.offerDeclineReason;
+      if (o.position) r.position = o.position;
+      if (r.status !== "Full verified") r.status = "Accepted";
+      r.notes = r.notes.replace("Offer acceptance date is estimated. Offer terms were not recoverable.", "Offer terms were not recoverable.");
+      if (!r.notes.includes("Offer terms were not recoverable.")) r.notes += "\nOffer terms were not recoverable.";
+      r.notes +=
+        `\nOffer accepted ${o.at.slice(0, 10)} (from Telegram)` +
+        (o.engagedAs ? `; engaged as: ${o.engagedAs}` : "") +
+        (o.available ? `; available: ${o.available}` : "") +
+        ".";
+    } else if (!r.offerAcceptedAt || r.offerAcceptedAt < o.at) {
+      r.offerDeclinedAt = o.at;
+      if (o.reason) r.offerDeclineReason = o.reason;
+      r.notes += `\nOffer declined ${o.at.slice(0, 10)} (from Telegram)${o.reason ? `: ${o.reason}` : ""}.`;
+    }
+  }
+
   records.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || ""));
   writeFileSync(path.join(OUT, "candidates.json"), JSON.stringify(records, null, 2));
   if (READ_IDS) writeFileSync(path.join(OUT, "id-data.json"), JSON.stringify(idData, null, 2));
@@ -1374,6 +1434,11 @@ async function main() {
         `Check against folders known from the "submitted" message: CV email agrees ${agree}, disagrees ${disagree}.`,
     );
   }
+  console.log(
+    `Application form submitted: ${records.filter((r) => r.submittedAt).length}; interview completed with score: ${records.filter((r) => r.interview).length}; ` +
+      `offers accepted: ${records.filter((r) => r.offerAcceptedAt && r.notes.includes("Offer accepted")).length}, declined: ${records.filter((r) => r.offerDeclinedAt).length} ` +
+      `(${offerStats.unsure} offer messages with a name shared by several candidates, ${offerStats.none} with no candidate of that name).`,
+  );
   console.log(`Voice recordings found: ${records.filter((r) => r.voiceStatus === "Voice Recording Received").length} candidates (status set to "Voice Recording Received").`);
   const agreeN = all.filter((f) => f.idCvNames === "agree").length;
   const differN = all.filter((f) => f.idCvNames === "differ").length;
