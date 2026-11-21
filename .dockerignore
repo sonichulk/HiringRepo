@@ -1,0 +1,11 @@
+# Never in the image: secrets, personal data, local builds.
+.env*
+data
+recovered
+result.json
+node_modules
+.next
+.git
+.github
+gateway
+*.log

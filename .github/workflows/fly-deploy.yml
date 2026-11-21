@@ -1,0 +1,40 @@
+# Deploys the site to Fly.io on every push to the deploy branch, like Railway did.
+#
+# Needs two repository secrets (Settings → Secrets and variables → Actions):
+#   FLY_API_TOKEN   from `fly tokens create deploy`
+#   R2_ACCOUNT_ID   your Cloudflare account id (used at build time)
+# Until FLY_API_TOKEN is set, this does nothing.
+
+name: Deploy to Fly.io
+
+on:
+  push:
+    branches: [claude/wizardly-fermi-f6pgm2]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - "scripts/rebuild-candidates.mjs"
+      - "scripts/find-address-proof.mjs"
+  workflow_dispatch:
+
+concurrency:
+  group: fly-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+    steps:
+      - name: Not set up yet
+        if: env.FLY_API_TOKEN == ''
+        run: echo "FLY_API_TOKEN is not set, so nothing is deployed. See docs/DEPLOY_FLY.md."
+      - uses: actions/checkout@v4
+        if: env.FLY_API_TOKEN != ''
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+        if: env.FLY_API_TOKEN != ''
+      - name: Deploy
+        if: env.FLY_API_TOKEN != ''
+        run: flyctl deploy --remote-only --build-arg R2_ACCOUNT_ID="$R2_ACCOUNT_ID"

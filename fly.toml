@@ -1,0 +1,50 @@
+# Fly.io settings for the site. Step-by-step setup: docs/DEPLOY_FLY.md
+#
+# One app serves both domains: workroute.co.uk (hiring site, admin panel)
+# and workroute.team (team portal); the site tells them apart by host name,
+# so the separate gateway used on Railway is not needed here.
+
+# Must match the name chosen with `fly apps create` (see the guide).
+app = "workroute"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "8080"
+  # The persistent volume below: candidates, chats, team and settings.
+  DATA_DIR = "/data"
+  PUBLIC_BASE_URL = "https://workroute.co.uk"
+  TEAM_PORTAL_URL = "https://workroute.team"
+
+[[mounts]]
+  source = "workroute_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Always on: live chat, the team portal's hours and reminders run in the
+  # background, and a stopped machine would miss them.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "30s"
+    method = "GET"
+    path = "/"
+    timeout = "10s"
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
