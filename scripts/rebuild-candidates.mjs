@@ -1222,6 +1222,14 @@ async function main() {
       if (f.mrz.nationality) notes.push(`ID read: ${f.mrz.documentType}, nationality ${f.mrz.nationality}${f.mrz.expiryDate ? `, expires ${f.mrz.expiryDate}` : ""}${f.mrz.sure ? "" : " (not certain)"}.`);
     }
 
+    // A voice recording on file: received. Whether it passed or failed was
+    // decided by a recruiter and is not recoverable.
+    const voice = files.filter((x) => x.kind === "voice").at(-1);
+    if (voice) {
+      c.voiceStatus = "Voice Recording Received";
+      notes.push(`Voice recording received ${voice.at.slice(0, 10)}. Whether it was passed or failed was not recoverable.`);
+    }
+
     // Proof of address: the files, and what they typed (from Telegram).
     const proofs = files.filter((x) => x.kind === "addressProof");
     if (proofs.length) {
@@ -1366,6 +1374,7 @@ async function main() {
         `Check against folders known from the "submitted" message: CV email agrees ${agree}, disagrees ${disagree}.`,
     );
   }
+  console.log(`Voice recordings found: ${records.filter((r) => r.voiceStatus === "Voice Recording Received").length} candidates (status set to "Voice Recording Received").`);
   const agreeN = all.filter((f) => f.idCvNames === "agree").length;
   const differN = all.filter((f) => f.idCvNames === "differ").length;
   if (agreeN + differN) console.log(`Name on ID compared with name in CV: ${agreeN} agree, ${differN} differ (noted on those candidates to check).`);
