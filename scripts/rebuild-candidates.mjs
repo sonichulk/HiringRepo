@@ -191,11 +191,36 @@ const phoneKey = (s) => {
   return d.length >= 9 ? d.slice(-9) : "";
 };
 
-/** Email addresses and phone numbers in a text. Nothing else is kept. */
+const titleCase = (s) => s.toLowerCase().replace(/(^|[\s'’-])(\p{L})/gu, (_, sep, ch) => sep + ch.toUpperCase());
+const NOT_A_NAME =
+  /\b(curriculum|vitae|resume|résumé|cv|profile|summary|contact|e-?mail|phone|mobile|tel|address|objective|experience|education|skills|page|personal|information|details|career|professional|about|customer|service|support|agent|manager|representative|assistant|specialist|cover|letter|dear|sincerely)\b/i;
+
+/** The person's name, as most CVs start: a short line of two to four capitalised words. */
+function nameIn(text) {
+  const lines = text.split("\n").map((l) => l.replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 12);
+  for (const line of lines) {
+    const l = line.replace(/^(full\s+)?name\s*[:\-–]\s*/i, "");
+    if (l.length < 4 || l.length > 40 || /[0-9@/\\|:•,()]/.test(l) || NOT_A_NAME.test(l)) continue;
+    const words = l.split(" ");
+    if (words.length < 2 || words.length > 4) continue;
+    if (!words.every((w) => /^\p{Lu}[\p{L}'’.-]*$/u.test(w))) continue;
+    return l === l.toUpperCase() ? titleCase(l) : l;
+  }
+  return "";
+}
+
+/** Email addresses, phone numbers and the name at the top of a CV. The rest of the text is not kept. */
 function contactsIn(text) {
   const emails = [...new Set((text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) ?? []).map((e) => e.toLowerCase().replace(/\.$/, "")))];
-  const phones = [...new Set((text.match(/\+?\d[\d\s().-]{7,}\d/g) ?? []).map(phoneKey).filter(Boolean))];
-  return { emails: emails.slice(0, 10), phones: phones.slice(0, 10) };
+  const rawPhones = (text.match(/\+?\d[\d\s().-]{7,}\d/g) ?? []).map((p) => p.replace(/\s+/g, " ").trim());
+  const seen = new Set();
+  const phonesRaw = rawPhones.filter((p) => {
+    const k = phoneKey(p);
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  return { v: 2, emails: emails.slice(0, 10), phones: [...seen].slice(0, 10), phonesRaw: phonesRaw.slice(0, 5), name: nameIn(text) };
 }
 
 // ------------------------------------------------------------------ Telegram
@@ -623,8 +648,15 @@ async function main() {
     cvCache = {};
   }
   for (const f of folders.values()) {
-    const cv = f.files.filter((x) => x.kind === "cv" || x.kind === "cover").map((x) => cvCache[x.key]).filter(Boolean);
-    if (cv.length) f.cv = { emails: [...new Set(cv.flatMap((c) => c.emails))], phones: [...new Set(cv.flatMap((c) => c.phones))] };
+    const cv = f.files.filter((x) => x.kind === "cv" || x.kind === "cover").sort((x, y) => (x.kind === "cv" ? -1 : 1) - (y.kind === "cv" ? -1 : 1)).map((x) => cvCache[x.key]).filter(Boolean);
+    if (cv.length) {
+      f.cv = {
+        emails: [...new Set(cv.flatMap((c) => c.emails))],
+        phones: [...new Set(cv.flatMap((c) => c.phones))],
+        phonesRaw: cv.flatMap((c) => c.phonesRaw ?? []),
+        name: cv.map((c) => c.name).find(Boolean) ?? "",
+      };
+    }
   }
   if (READ_CVS) {
     let pdfjs;
@@ -642,7 +674,7 @@ async function main() {
         let text = "";
         for (let i = 1; i <= Math.min(doc.numPages, 3); i++) {
           const page = await doc.getPage(i);
-          text += (await page.getTextContent()).items.map((x) => x.str ?? "").join(" ") + "\n";
+          text += (await page.getTextContent()).items.map((x) => (x.str ?? "") + (x.hasEOL ? "\n" : " ")).join("") + "\n";
         }
         await doc.destroy();
         return text;
@@ -651,7 +683,7 @@ async function main() {
       return "";
     };
     const todo = [...folders.values()].flatMap((f) =>
-      f.files.filter((x) => (x.kind === "cv" || x.kind === "cover") && /\.(pdf|docx)$/i.test(x.file) && !(x.key in cvCache)),
+      f.files.filter((x) => (x.kind === "cv" || x.kind === "cover") && /\.(pdf|docx)$/i.test(x.file) && !(x.key in cvCache && (cvCache[x.key] === null || cvCache[x.key].v === 2))),
     );
     console.log(`Reading ${todo.length} CVs and cover letters…`);
     const t0 = Date.now();
@@ -684,8 +716,15 @@ async function main() {
     clearInterval(alive);
     writeFileSync(cvCachePath, JSON.stringify(cvCache));
     for (const f of folders.values()) {
-      const cv = f.files.filter((x) => x.kind === "cv" || x.kind === "cover").map((x) => cvCache[x.key]).filter(Boolean);
-      if (cv.length) f.cv = { emails: [...new Set(cv.flatMap((c) => c.emails))], phones: [...new Set(cv.flatMap((c) => c.phones))] };
+      const cv = f.files.filter((x) => x.kind === "cv" || x.kind === "cover").sort((x, y) => (x.kind === "cv" ? -1 : 1) - (y.kind === "cv" ? -1 : 1)).map((x) => cvCache[x.key]).filter(Boolean);
+      if (cv.length) {
+      f.cv = {
+        emails: [...new Set(cv.flatMap((c) => c.emails))],
+        phones: [...new Set(cv.flatMap((c) => c.phones))],
+        phonesRaw: cv.flatMap((c) => c.phonesRaw ?? []),
+        name: cv.map((c) => c.name).find(Boolean) ?? "",
+      };
+    }
     }
   }
 
@@ -1117,7 +1156,8 @@ async function main() {
 
     const name = a ? { firstName: a.firstName, lastName: a.lastName, fullName: a.fullName } : null;
     const titled = (s) => s.toLowerCase().replace(/(^|[\s'-])(\p{L})/gu, (_, sep, ch) => sep + ch.toUpperCase());
-    const docName = f?.agreement?.name || f?.signedName || (f?.mrz ? titled(`${f.mrz.firstName} ${f.mrz.lastName}`.trim()) : "");
+    const docName =
+      f?.agreement?.name || f?.signedName || (f?.mrz ? titled(`${f.mrz.firstName} ${f.mrz.lastName}`.trim()) : "") || (!a ? f?.cv?.name ?? "" : "");
     const fallback = docName.split(" ");
     const c = {
       id: f?.id ?? newId(),
@@ -1125,8 +1165,8 @@ async function main() {
       lastName: name?.lastName ?? (f?.mrz && !f.agreement?.name && !f.signedName ? titled(f.mrz.lastName) : fallback.at(-1) ?? ""),
       fullName: name?.fullName ?? docName,
       dob: a?.dob || a?.dobRaw || f?.mrz?.dateOfBirth || "",
-      email: a?.email ?? "",
-      phone: a?.phone ?? "",
+      email: a ? a.email : f?.cv?.emails[0] ?? "",
+      phone: a ? a.phone : f?.cv?.phonesRaw?.[0] ?? "",
       country: a?.country ?? "",
       city: a?.city ?? "",
       address: a?.address ?? "",
@@ -1140,7 +1180,14 @@ async function main() {
     };
     const notes = [`Rebuilt on ${rebuiltAt.slice(0, 10)} after the host volume was lost.`];
     if (match) notes.push(`Matched to the Telegram application by: ${match.why.join(", ")}.`);
-    else if (f && a === null) notes.push("No Telegram application could be matched to these files: check name and details.");
+    else if (f && a === null) {
+      const from = f.agreement?.name || f.signedName ? "their agreement" : f.mrz ? "their ID" : f.cv?.name ? "the top of their CV (check it)" : "";
+      notes.push(
+        "No Telegram message about this person (their country's applications were not posted to Telegram). " +
+          `Added from their files: ${c.email ? "email" : ""}${c.email && c.phone ? " and " : ""}${c.phone ? "phone" : ""}${c.email || c.phone ? " from their CV" : "no contact details found"}` +
+          `${from ? `; name from ${from}` : "; no name found — open their CV"}.`,
+      );
+    }
     if (!f) {
       const could = a ? maybeFolders.get(a.n) ?? [] : [];
       notes.push(
@@ -1198,7 +1245,7 @@ async function main() {
     c.notesUpdatedAt = rebuiltAt;
 
     // Sure only with evidence beyond timing: a reference, a name on a document, an upload just before its message.
-    const sure = !match ? (a ? "no files" : "not matched") : match.pts >= 80 ? "high" : "medium";
+    const sure = !match ? (a ? "no files" : "from files only") : match.pts >= 80 ? "high" : "medium";
     const why = match
       ? match.why.join("; ")
       : !f && a && maybeFolders.has(a.n)
@@ -1213,8 +1260,25 @@ async function main() {
   for (const f of folders.values()) {
     const m = folderMatch.get(f.id);
     if (m) records.push(build(f, m.a, m));
-    else if (f.agreement?.name || f.signedName || f.mrz || INCLUDE_UNNAMED) records.push(build(f, null, null));
-    else {
+  }
+  const takenEmails = new Map(records.filter((r) => r.email).map((r) => [r.email, r.id]));
+  for (const f of folders.values()) {
+    if (folderMatch.has(f.id)) continue;
+    const cvEmail = f.cv?.emails[0];
+    if (cvEmail && takenEmails.has(cvEmail)) {
+      report.push({
+        c: { id: f.id, fullName: f.cv?.name ?? "", email: cvEmail, status: "", documents: f.files },
+        sure: "same person (left out)",
+        why: `another application of candidate ${takenEmails.get(cvEmail)} (same email in CV)`,
+        score: "",
+      });
+      continue;
+    }
+    if (f.agreement?.name || f.signedName || f.mrz || f.cv?.emails.length || f.cv?.phones.length || INCLUDE_UNNAMED) {
+      const r = build(f, null, null);
+      records.push(r);
+      if (r.email) takenEmails.set(r.email, r.id);
+    } else {
       const could = maybe.get(f.id);
       report.push({
         c: { id: f.id, fullName: "", email: "", status: "", documents: f.files },
@@ -1236,7 +1300,7 @@ async function main() {
   writeFileSync(path.join(OUT, "candidates.json"), JSON.stringify(records, null, 2));
   if (READ_IDS) writeFileSync(path.join(OUT, "id-data.json"), JSON.stringify(idData, null, 2));
 
-  const order = { high: 0, medium: 1, "no files": 2, "not matched": 3, "not matched (left out)": 4 };
+  const order = { high: 0, medium: 1, "from files only": 2, "no files": 3, "same person (left out)": 4, "not matched (left out)": 5 };
   report.sort((x, y) => order[x.sure] - order[y.sure] || (x.c.fullName || "~").localeCompare(y.c.fullName || "~"));
   writeFileSync(
     path.join(OUT, "rebuild-report.csv"),
@@ -1297,8 +1361,11 @@ async function main() {
   console.log(
     `\nDone. ${records.length} candidates in recovered/candidates.json:\n` +
       `  ${count("high")} matched for sure, ${count("medium")} probably right (check),\n` +
-      `  ${count("not matched")} with files but no Telegram match (check), ${count("no files")} from Telegram only.\n` +
-      `  ${count("not matched (left out)")} folders with no name were left out (add --include-unnamed to keep them).\n` +
+      `  ${count("from files only")} from their files only, not in Telegram (email from CV: ${records.filter((r) => report.find((x) => x.c === r)?.sure === "from files only" && r.email).length}, ` +
+      `name found: ${records.filter((r) => report.find((x) => x.c === r)?.sure === "from files only" && r.fullName).length}),\n` +
+      `  ${count("no files")} from Telegram only.\n` +
+      `  ${count("same person (left out)")} folders were a second application of someone already in the list.\n` +
+      `  ${count("not matched (left out)")} folders with no email, phone or name were left out (add --include-unnamed to keep them).\n` +
       `See recovered/rebuild-report.csv.`,
   );
 }
