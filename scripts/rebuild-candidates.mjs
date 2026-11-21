@@ -25,6 +25,7 @@
  *   R2 settings in .env.local, or as Codespaces secrets:
  *     R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
  *   For --ids only:  npm install --no-save tesseract.js@5 @tesseract.js-data/eng
+ *   For --cvs only:  npm install --no-save pdfjs-dist@4.10.38 mammoth@1.13.0
  *
  * Use:
  *   node scripts/rebuild-candidates.mjs --telegram result.json
@@ -55,6 +56,7 @@ const argValue = (name) => {
 };
 const TELEGRAM = argValue("--telegram");
 const READ_IDS = args.includes("--ids");
+const READ_CVS = args.includes("--cvs");
 const INCLUDE_UNNAMED = args.includes("--include-unnamed");
 
 if (!TELEGRAM) {
@@ -62,6 +64,7 @@ if (!TELEGRAM) {
     "Usage:\n  node scripts/rebuild-candidates.mjs --telegram result.json [--ids] [--include-unnamed]\n\n" +
       "  --telegram  the result.json from Telegram Desktop (Export chat history, format JSON)\n" +
       "  --ids       also read passports and ID cards in R2 (needs tesseract.js, see the top of this file)\n" +
+      "  --cvs       also read the email addresses and phone numbers in CVs (needs pdfjs-dist and mammoth)\n" +
       "  --include-unnamed  also add R2 folders nobody could be matched to, with no name",
   );
   process.exit(0);
@@ -180,6 +183,19 @@ function isoDob(s) {
   m = v.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/);
   if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
   return isoFromLongDate(v);
+}
+
+/** The last nine digits of a phone number: enough to compare, whatever the dialling code or spacing. */
+const phoneKey = (s) => {
+  const d = String(s ?? "").replace(/\D/g, "");
+  return d.length >= 9 ? d.slice(-9) : "";
+};
+
+/** Email addresses and phone numbers in a text. Nothing else is kept. */
+function contactsIn(text) {
+  const emails = [...new Set((text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) ?? []).map((e) => e.toLowerCase().replace(/\.$/, "")))];
+  const phones = [...new Set((text.match(/\+?\d[\d\s().-]{7,}\d/g) ?? []).map(phoneKey).filter(Boolean))];
+  return { emails: emails.slice(0, 10), phones: phones.slice(0, 10) };
 }
 
 // ------------------------------------------------------------------ Telegram
@@ -596,6 +612,79 @@ async function main() {
   if (process.stdout.isTTY) process.stdout.write("\n");
   console.log(`Agreements read in ${Math.max(1, Math.round((Date.now() - started) / 60000))} min.`);
 
+  // CVs: only the email addresses and phone numbers in them are kept (in
+  // cv-cache.json, so a stopped run carries on), never the text.
+  const cvCachePath = path.join(OUT, "cv-cache.json");
+  let cvCache = {};
+  try {
+    cvCache = JSON.parse(readFileSync(cvCachePath, "utf8"));
+  } catch {
+    cvCache = {};
+  }
+  for (const f of folders.values()) {
+    const cv = f.files.filter((x) => x.kind === "cv" || x.kind === "cover").map((x) => cvCache[x.key]).filter(Boolean);
+    if (cv.length) f.cv = { emails: [...new Set(cv.flatMap((c) => c.emails))], phones: [...new Set(cv.flatMap((c) => c.phones))] };
+  }
+  if (READ_CVS) {
+    let pdfjs;
+    let mammoth;
+    try {
+      pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+      mammoth = (await import("mammoth")).default;
+    } catch {
+      console.error("To read CVs, first run:\n  npm install --no-save pdfjs-dist@4.10.38 mammoth@1.13.0");
+      process.exit(1);
+    }
+    const textOf = async (file, bytes) => {
+      if (/\.pdf$/i.test(file)) {
+        const doc = await pdfjs.getDocument({ data: new Uint8Array(bytes), isEvalSupported: false, disableFontFace: true, verbosity: 0 }).promise;
+        let text = "";
+        for (let i = 1; i <= Math.min(doc.numPages, 3); i++) {
+          const page = await doc.getPage(i);
+          text += (await page.getTextContent()).items.map((x) => x.str ?? "").join(" ") + "\n";
+        }
+        await doc.destroy();
+        return text;
+      }
+      if (/\.docx$/i.test(file)) return (await mammoth.extractRawText({ buffer: bytes })).value;
+      return "";
+    };
+    const todo = [...folders.values()].flatMap((f) =>
+      f.files.filter((x) => (x.kind === "cv" || x.kind === "cover") && /\.(pdf|docx)$/i.test(x.file) && !(x.key in cvCache)),
+    );
+    console.log(`Reading ${todo.length} CVs and cover letters…`);
+    const t0 = Date.now();
+    let done = 0;
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: 4 }, async () => {
+        while (next < todo.length) {
+          const x = todo[next++];
+          try {
+            const text = await withTimeout(
+              getBytes(x.key).then((b) => textOf(x.file, b)),
+              90_000,
+            );
+            cvCache[x.key] = contactsIn(text);
+          } catch {
+            cvCache[x.key] = null;
+          }
+          done++;
+          if (done % 50 === 0) writeFileSync(cvCachePath, JSON.stringify(cvCache));
+          if (done % 100 === 0 || done === todo.length) {
+            const mins = (Date.now() - t0) / 60000;
+            console.log(`Reading CVs… ${done} of ${todo.length} (${Math.round(mins)} min so far, about ${Math.round((mins / done) * (todo.length - done))} min left)`);
+          }
+        }
+      }),
+    );
+    writeFileSync(cvCachePath, JSON.stringify(cvCache));
+    for (const f of folders.values()) {
+      const cv = f.files.filter((x) => x.kind === "cv" || x.kind === "cover").map((x) => cvCache[x.key]).filter(Boolean);
+      if (cv.length) f.cv = { emails: [...new Set(cv.flatMap((c) => c.emails))], phones: [...new Set(cv.flatMap((c) => c.phones))] };
+    }
+  }
+
   // …then the IDs, several at a time. Each one read is remembered in
   // id-cache.json, so a stopped run carries on where it was.
   const idData = [];
@@ -920,6 +1009,23 @@ async function main() {
       else if (same.length === 1) add(same, 40, "name on ID");
       else if (same.length) add([pickByTime(same, f)], 10, "name on ID (shared by others)");
     }
+    // 4a. The email address or phone number written in their CV.
+    if (f.cv) {
+      // Their own address normally comes first, at the top; later ones are
+      // often referees or former employers.
+      const byMail = f.cv.emails.filter((e) => byEmail.has(e));
+      byMail.forEach((e, i) =>
+        add(
+          appsFor(e, "", f),
+          byMail.length === 1 ? 90 : i === 0 ? 70 : 20,
+          byMail.length === 1 ? "email in CV" : i === 0 ? "first email in CV" : "another email in CV",
+        ),
+      );
+      const byPhone = tg.applications.filter((a) => a.phone && f.cv.phones.includes(phoneKey(a.phone)));
+      const people = new Set(byPhone.map((a) => a.email || a.key));
+      if (people.size === 1) add([pickByTime(byPhone, f)], 60, "phone in CV");
+      else if (people.size > 1) add(byPhone.map((a) => pickByTime([a], f)), 10, "phone in CV (several)");
+    }
     // 4b. ID photos uploaded minutes after "Interview completed": that email is the owner.
     if (f.interviewLink) {
       for (const iv of f.interviewLink.list) {
@@ -1162,6 +1268,22 @@ async function main() {
       `For those, the nearest "submitted" message was: ` +
         `before the upload: ${g(-Infinity, -3_000)}; 3–30 min after: ${g(3 * MIN, 30 * MIN)}; ` +
         `30 min–1 day after: ${g(30 * MIN, 24 * HOUR)}; more than a day after or none: ${g(24 * HOUR, Infinity) + lone.filter((f) => f.nearestSubmitted === undefined).length}.`,
+    );
+  }
+  if (all.some((f) => f.cv)) {
+    let agree = 0;
+    let disagree = 0;
+    for (const f of all) {
+      const m = folderMatch.get(f.id);
+      if (!f.cv || !m || !m.why.includes("form submitted right after the CV upload")) continue;
+      const other = f.cv.emails.filter((e) => byEmail.has(e));
+      if (!other.length) continue;
+      if (other.includes(m.a.email)) agree++;
+      else disagree++;
+    }
+    console.log(
+      `CVs read: ${all.filter((f) => f.cv).length} with an email or phone found. ` +
+        `Check against folders known from the "submitted" message: CV email agrees ${agree}, disagrees ${disagree}.`,
     );
   }
   const firstMsg = [...tg.applications, ...tg.submitted].map((x) => x.at).sort()[0] ?? "";
