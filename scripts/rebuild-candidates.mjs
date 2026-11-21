@@ -760,7 +760,10 @@ async function main() {
     }
     // The interview page asks for the ID photos the moment the assessment is
     // scored, and "Interview completed" (name, email) is sent at that moment:
-    // the photos follow it within minutes. Same rule: only when certain.
+    // the photos follow it, often within minutes but sometimes hours later.
+    // Same rule as above — linked only when each is the other's only
+    // possibility — and the settings are chosen by testing them on the
+    // candidates whose folder is already known, so we know how far to trust it.
     {
       const ID_KINDS = new Set(["identity", "identityBack", "selfie"]);
       const firstId = new Map();
@@ -768,12 +771,7 @@ async function main() {
         const t = f.files.filter((x) => ID_KINDS.has(x.kind)).map((x) => ms(x.at));
         if (t.length) firstId.set(f.id, Math.min(...t));
       }
-      const doneF = new Map(); // folder id -> interview message
-      const doneM = new Set();
-      const maybeI = new Map();
-
-      // Folders already known through the "submitted" message: their owner's
-      // email, so that person's interviews are theirs and nobody else's.
+      // Folders already known through the "submitted" message, and their owner's email.
       const knownEmail = new Map();
       for (const f of folders.values()) {
         if (!f.submitted?.clear) continue;
@@ -782,66 +780,87 @@ async function main() {
         const a = same.length ? pickByTime(same, f) : null;
         if (a?.email) knownEmail.set(f.id, a.email);
       }
-      const ownedBy = new Map([...knownEmail].map(([fid, e]) => [e, fid]));
-      // How long people really take from "Interview completed" to the ID
-      // photos, measured on those known folders, sets the window.
-      const gaps = [];
-      for (const [fid, email] of knownEmail) {
-        const up = firstId.get(fid);
-        if (up === undefined) continue;
-        const own = tg.interviews.filter((iv) => iv.email === email).map((iv) => up - ms(iv.at)).filter((g) => g >= -MIN && g <= 24 * HOUR);
-        if (own.length) gaps.push(Math.min(...own));
-      }
-      gaps.sort((x, y) => x - y);
-      const p90 = gaps.length >= 10 ? gaps[Math.floor(gaps.length * 0.9)] : 15 * MIN;
-      const window1 = Math.min(Math.max(p90, 3 * MIN), 60 * MIN);
-      f0.idWindow = { measured: gaps.length, minutes: Math.round(window1 / MIN) };
-      for (const [fid, email] of knownEmail) {
-        const up = firstId.get(fid);
-        if (up === undefined) continue;
-        const own = tg.interviews.find((iv) => iv.email === email && up - ms(iv.at) >= -MIN && up - ms(iv.at) <= 24 * HOUR);
-        if (own) {
-          doneF.set(fid, own);
-          doneM.add(own);
-        }
-      }
-      const notOwned = (iv, fid) => !ownedBy.has(iv.email) || ownedBy.get(iv.email) === fid;
 
-      for (const WINDOW of [window1, 60 * MIN]) {
-        const forFolder = new Map();
-        const forMessage = new Map();
-        for (const [fid, up] of firstId) {
-          if (doneF.has(fid)) continue;
-          if (knownEmail.has(fid)) continue;
-          for (const iv of tg.interviews) {
-            if (doneM.has(iv) || !iv.email || !notOwned(iv, fid)) continue;
-            const gap = up - ms(iv.at);
-            if (gap < -MIN || gap > WINDOW) continue;
-            if (!forFolder.has(fid)) forFolder.set(fid, []);
-            forFolder.get(fid).push(iv);
-            if (!forMessage.has(iv)) forMessage.set(iv, []);
-            forMessage.get(iv).push(fid);
+      /** Link ID uploads to interviews, widening the window step by step. `known` folders own their email's interviews. */
+      const link = (windowsMin, known) => {
+        const ownedBy = new Map([...known].map(([fid, e]) => [e, fid]));
+        const doneF = new Map();
+        const doneM = new Set();
+        const maybe = new Map();
+        for (const [fid, email] of known) {
+          const up = firstId.get(fid);
+          if (up === undefined) continue;
+          const own = tg.interviews.find((iv) => iv.email === email && up - ms(iv.at) >= -MIN && up - ms(iv.at) <= 24 * HOUR);
+          if (own) doneM.add(own);
+        }
+        for (const W of windowsMin.map((m) => m * MIN)) {
+          const forFolder = new Map();
+          const forMessage = new Map();
+          for (const [fid, up] of firstId) {
+            if (doneF.has(fid) || known.has(fid)) continue;
+            for (const iv of tg.interviews) {
+              if (doneM.has(iv) || !iv.email) continue;
+              if (ownedBy.has(iv.email) && ownedBy.get(iv.email) !== fid) continue;
+              const gap = up - ms(iv.at);
+              if (gap < -MIN || gap > W) continue;
+              if (!forFolder.has(fid)) forFolder.set(fid, []);
+              forFolder.get(fid).push(iv);
+              if (!forMessage.has(iv)) forMessage.set(iv, []);
+              forMessage.get(iv).push(fid);
+            }
+          }
+          let changed = true;
+          while (changed) {
+            changed = false;
+            for (const [fid, list] of forFolder) {
+              if (doneF.has(fid)) continue;
+              const open = list.filter((iv) => !doneM.has(iv));
+              if (open.length !== 1) continue;
+              if (forMessage.get(open[0]).some((id) => id !== fid && !doneF.has(id))) continue;
+              doneF.set(fid, open[0]);
+              doneM.add(open[0]);
+              changed = true;
+            }
+          }
+          for (const [fid, list] of forFolder) if (!doneF.has(fid)) maybe.set(fid, list.filter((iv) => !doneM.has(iv)));
+        }
+        return { doneF, maybe };
+      };
+
+      // Test each setting: hide half of the known folders, link, and check
+      // the answers on the hidden half; then the other half.
+      const knownWithId = [...knownEmail].filter(([fid]) => firstId.has(fid));
+      const SETTINGS = [[5], [10], [5, 15], [5, 15, 30], [5, 15, 30, 60], [15], [15, 60], [60]];
+      const tested = SETTINGS.map((windows) => {
+        let right = 0;
+        let wrong = 0;
+        for (const half of [0, 1]) {
+          const hidden = new Map(knownWithId.filter((_, i) => i % 2 === half));
+          const shown = new Map([...knownEmail].filter(([fid]) => !hidden.has(fid)));
+          const { doneF } = link(windows, shown);
+          for (const [fid, email] of hidden) {
+            const got = doneF.get(fid);
+            if (!got) continue;
+            if (got.email === email) right++;
+            else wrong++;
           }
         }
-        let changed = true;
-        while (changed) {
-          changed = false;
-          for (const [fid, list] of forFolder) {
-            if (doneF.has(fid)) continue;
-            const open = list.filter((iv) => !doneM.has(iv));
-            if (open.length !== 1) continue;
-            if (forMessage.get(open[0]).some((id) => id !== fid && !doneF.has(id))) continue;
-            doneF.set(fid, open[0]);
-            doneM.add(open[0]);
-            changed = true;
-          }
-        }
-        for (const [fid, list] of forFolder) if (!doneF.has(fid)) maybeI.set(fid, list.filter((iv) => !doneM.has(iv)));
-      }
+        return { windows, right, wrong };
+      });
+      // The setting that finds the most while staying right at least 98% of
+      // the time; if none does, the most accurate one, and trusted less.
+      const good = tested.filter((t) => t.right + t.wrong >= 10 && t.wrong <= 0.02 * (t.right + t.wrong));
+      const chosen = good.length
+        ? good.reduce((x, y) => (y.right > x.right ? y : x))
+        : tested.reduce((x, y) => (y.right / (y.right + y.wrong || 1) > x.right / (x.right + x.wrong || 1) ? y : x));
+      const trusted = good.length > 0;
+      f0.idCheck = { ...chosen, tested: knownWithId.length, trusted };
+
+      const { doneF, maybe } = link(chosen.windows, knownEmail);
       for (const f of folders.values()) {
         if (knownEmail.has(f.id)) continue; // already known; its interview adds nothing new
-        if (doneF.has(f.id)) f.interviewLink = { list: [doneF.get(f.id)], clear: true };
-        else if (maybeI.get(f.id)?.length) f.interviewLink = { list: maybeI.get(f.id), clear: false };
+        if (doneF.has(f.id)) f.interviewLink = { list: [doneF.get(f.id)], clear: true, trusted };
+        else if (maybe.get(f.id)?.length) f.interviewLink = { list: maybe.get(f.id), clear: false };
       }
     }
 
@@ -906,7 +925,7 @@ async function main() {
       for (const iv of f.interviewLink.list) {
         add(
           appsFor(iv.email, iv.key, f),
-          f.interviewLink.clear ? 80 : 10,
+          f.interviewLink.clear ? (f.interviewLink.trusted ? 80 : 15) : 5,
           f.interviewLink.clear ? "ID uploaded right after their interview" : "ID uploaded after an interview (someone else's too)",
         );
       }
@@ -1124,8 +1143,11 @@ async function main() {
   const withForm = all.filter((f) => f.files.some((x) => APPLICATION_KINDS.has(x.kind)));
   console.log(
     `\nID photos linked for sure to an "Interview completed" message: ${all.filter((f) => f.interviewLink?.clear).length}; ` +
-      `several possible: ${all.filter((f) => f.interviewLink && !f.interviewLink.clear).length} ` +
-      `(window ${f0.idWindow?.minutes ?? "?"} min, measured on ${f0.idWindow?.measured ?? 0} known candidates).`,
+      `several possible: ${all.filter((f) => f.interviewLink && !f.interviewLink.clear).length}.` +
+      (f0.idCheck
+        ? `\nChecked on ${f0.idCheck.tested} candidates already known: ${f0.idCheck.right} right, ${f0.idCheck.wrong} wrong ` +
+          `(windows ${f0.idCheck.windows.join("/")} min)${f0.idCheck.trusted ? "" : " — not reliable enough on its own: used only to support other evidence"}.`
+        : ""),
   );
   console.log(
     `Folders: ${all.length}; with a CV or other form file: ${withForm.length}; ` +
