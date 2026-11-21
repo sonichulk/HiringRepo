@@ -587,6 +587,7 @@ async function main() {
   for (const f of folders.values()) {
     n++;
     if (process.stdout.isTTY && (n % 5 === 0 || n === folders.size)) process.stdout.write(`\rReading agreements… ${n} of ${folders.size}`);
+    else if (!process.stdout.isTTY && (n % 250 === 0 || n === folders.size)) console.log(`Reading agreements… ${n} of ${folders.size}`);
     f.files.sort((a, b) => a.at.localeCompare(b.at));
     const newest = (kind) => f.files.filter((x) => x.kind === kind).at(-1);
     const appTimes = f.files.filter((x) => APPLICATION_KINDS.has(x.kind)).map((x) => x.at);
@@ -656,6 +657,8 @@ async function main() {
     const t0 = Date.now();
     let done = 0;
     let next = 0;
+    const alive = setInterval(() => console.log(`Still reading CVs: ${done} of ${todo.length} done (${Math.round((Date.now() - t0) / 60000)} min so far).`), 60_000);
+    alive.unref();
     await Promise.all(
       Array.from({ length: 4 }, async () => {
         while (next < todo.length) {
@@ -671,13 +674,14 @@ async function main() {
           }
           done++;
           if (done % 50 === 0) writeFileSync(cvCachePath, JSON.stringify(cvCache));
-          if (done % 100 === 0 || done === todo.length) {
+          if (done % 25 === 0 || done === todo.length) {
             const mins = (Date.now() - t0) / 60000;
             console.log(`Reading CVs… ${done} of ${todo.length} (${Math.round(mins)} min so far, about ${Math.round((mins / done) * (todo.length - done))} min left)`);
           }
         }
       }),
     );
+    clearInterval(alive);
     writeFileSync(cvCachePath, JSON.stringify(cvCache));
     for (const f of folders.values()) {
       const cv = f.files.filter((x) => x.kind === "cv" || x.kind === "cover").map((x) => cvCache[x.key]).filter(Boolean);
@@ -724,7 +728,7 @@ async function main() {
     // A sign of life every five minutes, even when no 25 have finished.
     const heartbeat = setInterval(() => {
       console.log(`Still working: ${finished} of ${todo.length} done (${Math.round((Date.now() - t0) / 60000)} min so far).`);
-    }, 5 * 60_000);
+    }, 2 * 60_000);
     heartbeat.unref();
     const one = async (f) => {
       let didRead = false;
@@ -774,6 +778,7 @@ async function main() {
     for (const f of folders.values()) idData.push({ candidateId: f.id, ...(f.mrz ?? { read: false }) });
   }
 
+  console.log("Matching folders to people…");
   // ---- matching: score every (folder, application) pair, best pairs first.
   const byEmail = new Map();
   for (const a of tg.applications) {
