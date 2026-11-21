@@ -647,7 +647,7 @@ const FILE_TYPES = { ".pdf": "application/pdf", ".png": "image/png", ".jpg": "im
  * their schedule and rate — those, their professional email, password, bank
  * details and worked hours were only on the lost volume.
  */
-async function recoverTeam(tg, records, byName, rebuiltAt) {
+async function recoverTeam(tg, records, byName, rebuiltAt, teamEmails = new Map()) {
   const drafts = new Map(); // name key -> draft
   for (const m of [...tg.team].sort((a, b) => a.at.localeCompare(b.at))) {
     if (!m.key) continue;
@@ -658,6 +658,20 @@ async function recoverTeam(tg, records, byName, rebuiltAt) {
     if (/Day off/i.test(m.title)) d.daysOff.push(m.line.replace(/^Day:\s*/, ""));
     if (/Bank details/i.test(m.title)) d.bank = m.at;
     drafts.set(m.key, d);
+  }
+
+  // People who received emails only team members get (login details, new
+  // mail, new message, sign-in code), at their personal address.
+  for (const [email, info] of teamEmails) {
+    const r = records.find((x) => x.email && x.email.toLowerCase() === email);
+    const key = r?.fullName ? nameKey(r.fullName) : `email:${email}`;
+    const d = drafts.get(key) ?? { name: r?.fullName || email, key, ids: new Set(), first: info.first, activatedAt: "", tickets: [], daysOff: [], bank: "" };
+    d.record = r ?? d.record;
+    d.email = email;
+    d.welcomed = info.welcomed;
+    d.portalEmailAt = info.first;
+    if (info.first < d.first) d.first = info.first;
+    drafts.set(key, d);
   }
 
   // Their files in R2: documents shared with them, and mail attachments.
@@ -678,7 +692,7 @@ async function recoverTeam(tg, records, byName, rebuiltAt) {
   for (const d of drafts.values()) {
     const id = [...d.ids].find((x) => !usedIds.has(x)) ?? randomBytes(9).toString("base64url");
     usedIds.add(id);
-    const { one: c } = byName(d.key);
+    const c = d.record ?? (d.key.startsWith("email:") ? null : byName(d.key).one);
     if (c) linked++;
     const firstWorkDay = c?.agreementStartDate || (d.activatedAt ? d.activatedAt.slice(0, 10) : today);
     const f = folders.get(id);
@@ -696,7 +710,8 @@ async function recoverTeam(tg, records, byName, rebuiltAt) {
       };
     });
     const notes = [
-      `Recovered on ${today} after the host volume was lost${c ? "" : " — no candidate of this name was found: add their email"}.`,
+      `Recovered on ${today} after the host volume was lost${c ? "" : d.email ? " — no candidate with this email was found: add their name" : " — no candidate of this name was found: add their email"}.`,
+      d.welcomed ? `Their portal login details had been emailed (first portal email ${d.portalEmailAt.slice(0, 10)}).` : "",
       "Before activating: set their professional email, schedule, hours per day and hourly rate (all lost — shown here as defaults, rate 0).",
       "Then press Send portal login (a new password) and ask them to add their bank details again.",
       "Hours worked before were lost: ask them to confirm, and add them by hand.",
@@ -709,7 +724,7 @@ async function recoverTeam(tg, records, byName, rebuiltAt) {
       id,
       ...(c ? { candidateId: c.id } : {}),
       fullName: c?.fullName || d.name,
-      loginEmail: c?.email || "",
+      loginEmail: c?.email || d.email || "",
       ...(c?.phone ? { personalPhone: c.phone } : {}),
       ...(c?.country ? { country: c.country } : {}),
       ...(c?.position ? { position: c.position } : {}),
@@ -754,14 +769,98 @@ async function recoverTeam(tg, records, byName, rebuiltAt) {
 
 // ------------------------------------------------------------------ sent-email log
 
-/** Subjects of the site's own emails, and what each one marks. */
+/**
+ * Subjects of the site's own emails, and what each one marks on the
+ * candidate — the same fields the site sets when it sends them.
+ */
+const first = (field) => (r, at) => {
+  if (!r[field] || at < r[field]) r[field] = at;
+};
+const list = (field) => (r, at) => {
+  r[field] = [...new Set([...(r[field] ?? []), at])].sort();
+};
 const EMAIL_STEPS = [
-  { subject: "Complete your WorkRoute online assessment", field: "invitationSentAt", status: "Interview Invitation Sent" },
-  { subject: "Confirm your identity to continue with WorkRoute", field: "verificationRequestedAt" },
-  { subject: "Congratulations — next step: your voice assessment", field: "voiceRequestedAt" },
-  { subject: "Good news | A place is available for you at WorkRoute", field: "offerSentAt", status: "Offer Sent" },
-  { subject: "Your agreement is ready — please confirm your address", field: "addressProofRequestedAt" },
-  { subject: "Confirm your company details before we issue your WorkRoute agreement", field: "companyRequestedAt" },
+  { subject: "Complete your WorkRoute online assessment", apply: first("invitationSentAt"), status: "Interview Invitation Sent" },
+  { subject: "Confirm your identity to continue with WorkRoute", apply: first("verificationRequestedAt") },
+  { subject: "Congratulations — next step: your voice assessment", apply: first("voiceRequestedAt"), voice: "Voice Assessment Requested" },
+  {
+    subject: "A minute of your time — your WorkRoute voice assessment",
+    apply: (r, at) => {
+      list("__voiceReminders")(r, at);
+      r.voiceReminderCount = r.__voiceReminders.length;
+      r.voiceReminderSentAt = r.__voiceReminders.at(-1);
+    },
+    voice: "Voice Assessment Requested",
+  },
+  {
+    subject: "We have your voice recording — WorkRoute",
+    apply: (r, at) => {
+      list("voiceAcks")(r, at);
+      r.voiceAckSentAt = r.voiceAcks.at(-1);
+      r.voiceAckCount = r.voiceAcks.length;
+    },
+    status: "Under Review",
+  },
+  {
+    subject: "Your information is verified — we'll be in touch",
+    apply: (r, at) => {
+      list("verifiedAcks")(r, at);
+      r.verifiedAckSentAt = r.verifiedAcks.at(-1);
+      if (r.voiceStatus !== "Voice Recording Received") r.voiceStatus = "Voice Skipped — Final Video Interview";
+    },
+  },
+  {
+    subject: "We've received your information – WorkRoute",
+    apply: (r, at) => {
+      list("submissionAcks")(r, at);
+      r.submissionAckSentAt = r.submissionAcks.at(-1);
+      r.submissionAckCount = r.submissionAcks.length;
+    },
+  },
+  { subject: "Good news | A place is available for you at WorkRoute", apply: first("offerSentAt"), status: "Offer Sent" },
+  { subject: "Job offer — ", apply: first("offerSentAt"), status: "Offer Sent" },
+  {
+    subject: "Your WorkRoute offer is waiting for your answer",
+    apply: (r, at) => {
+      list("offerReminders")(r, at);
+      r.offerReminderSentAt = r.offerReminders.at(-1);
+      r.offerReminderCount = r.offerReminders.length;
+    },
+  },
+  { subject: "Your agreement is ready — please confirm your address", apply: first("addressProofRequestedAt") },
+  { subject: "Confirm your company details before we issue your WorkRoute agreement", apply: first("companyRequestedAt") },
+  { subject: "Action Required: GSTIN Needed to Finalize Your Agreement", apply: list("gstinRequests") },
+  {
+    subject: "Your place is waiting for you — send us your GSTIN",
+    apply: (r, at) => {
+      r.gstinWaitingEmails = [...(r.gstinWaitingEmails ?? []).filter((x) => x.at !== at), { at }].sort((x, y) => x.at.localeCompare(y.at));
+    },
+  },
+  { subject: "One more document before your agreement", apply: first("residenceRequestedAt") },
+  { subject: "Identity Verification Unsuccessful", apply: first("identityReuploadRequestedAt") },
+  {
+    subject: "One last step before we can send your agreement",
+    apply: (r, at) => liveCheck(r, at, "agreement"),
+  },
+  { subject: "Identity verification required to issue your WorkRoute agreement", apply: (r, at) => liveCheck(r, at, "agreement") },
+  { subject: "We were unable to verify your identity — one quick step to finish it", apply: (r, at) => liveCheck(r, at, "retry") },
+  { subject: "Your final agreement — please sign and send it back", note: "Agreement emailed" },
+  { subject: "Your final interview — live chat with WorkRoute", note: "Final interview chat link emailed" },
+  { subject: "Reminder: complete your WorkRoute assessment", note: "Assessment reminder emailed" },
+];
+function liveCheck(r, at, reason) {
+  const sent = [...new Set([...(r.__live ?? []), at])].sort();
+  r.__live = sent;
+  r.liveVerificationSentAt = sent.at(-1);
+  r.liveVerificationCount = sent.length;
+  if (!r.liveVerificationReason || at === sent.at(-1)) r.liveVerificationReason = reason;
+}
+/** Emails only team members get, at their personal address. */
+const TEAM_SUBJECTS = [
+  "Welcome to the WorkRoute team",
+  "You have new email in your WorkRoute mailbox",
+  "You have a new message on your work number",
+  "is your WorkRoute sign-in code",
 ];
 const STATUS_ORDER = ["New Application", "Interview Invitation Sent", "Interview Pending", "Interview Completed", "Under Review", "Accepted", "Offer Sent"];
 
@@ -800,7 +899,30 @@ function parseCsv(text) {
   return rows.filter((r) => r.some((v) => v.trim())).map((r) => Object.fromEntries(head.map((h, i) => [h, r[i] ?? ""])));
 }
 
-/** A log of sent emails (CSV or JSON, as exported): dates of invitations, offers and requests. */
+/**
+ * A date as an email service writes it. "29/09/2026 03:14:03 PM" is read day
+ * first unless the log itself shows otherwise (a second number above 12).
+ */
+function dateReader(values) {
+  const slash = values.map((v) => String(v).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/)).filter(Boolean);
+  const monthFirst = slash.length && !slash.some((m) => Number(m[1]) > 12) && slash.some((m) => Number(m[2]) > 12);
+  return (v) => {
+    const m = String(v).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ T,]*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i);
+    if (!m) {
+      const d = new Date(v);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+    const [day, month] = monthFirst ? [m[2], m[1]] : [m[1], m[2]];
+    let hour = Number(m[4]);
+    const ampm = m[7]?.toUpperCase();
+    if (ampm === "PM" && hour < 12) hour += 12;
+    if (ampm === "AM" && hour === 12) hour = 0;
+    const d = new Date(Date.UTC(Number(m[3]), Number(month) - 1, Number(day), hour, Number(m[5]), Number(m[6] ?? 0)));
+    return Number.isNaN(d.getTime()) ? null : d;
+  };
+}
+
+/** A log of sent emails (CSV or JSON, as exported): what was sent to whom, and when. */
 function readEmailLog(file, records) {
   if (!file) return null;
   if (!existsSync(file)) {
@@ -817,35 +939,75 @@ function readEmailLog(file, records) {
   } catch {
     rows = parseCsv(text);
   }
-  const col = (row, re) => Object.keys(row).find((k) => re.test(k));
+  const keys = Object.keys(rows[0] ?? {});
+  const col = (re) => keys.find((k) => re.test(k));
+  const toKey = col(/^(to|recipient|recipients|to_address|to address|toaddress|to_email|to email|email|email address|destination)$/);
+  const subjectKey = col(/subject/);
+  const dateKey = col(/^(processed time|date|sent|sent at|sent_at|created|created at|created_at|timestamp|time|processed|delivered)/);
+  const bounceKey = col(/^hard bounce/);
+  if (!toKey || !subjectKey || !dateKey) {
+    console.log(`Email log: columns not recognised. Columns found: ${keys.join(", ") || "none"}.`);
+    return { rows: rows.length, used: 0, people: 0, bounced: 0, team: new Map() };
+  }
+  const readDate = dateReader(rows.map((r) => r[dateKey]));
   const byEmail = new Map(records.filter((r) => r.email).map((r) => [r.email.toLowerCase(), r]));
-  const stats = { rows: rows.length, used: 0, people: 0 };
+  const stats = { rows: rows.length, used: 0, people: 0, bounced: 0, unknown: 0, team: new Map() };
   const touched = new Set();
+  const notes = new Map(); // record -> notes to add
+  const note = (r, line) => {
+    if (!notes.has(r)) notes.set(r, new Set());
+    notes.get(r).add(line);
+  };
+  const unknownTo = new Set();
   for (const row of rows) {
-    const toKey = col(row, /^(to|recipient|recipients|to_address|to address|toaddress|to_email|to email|email|email address|destination)$/);
-    const subjectKey = col(row, /subject/);
-    const dateKey = col(row, /^(date|sent|sent at|sent_at|created|created at|created_at|timestamp|time|processed|delivered)/);
-    if (!toKey || !subjectKey || !dateKey) continue;
-    const at = new Date(row[dateKey]);
-    if (Number.isNaN(at.getTime())) continue;
-    const step = EMAIL_STEPS.find((s) => row[subjectKey].trim().startsWith(s.subject));
-    if (!step) continue;
-    for (const e of (row[toKey].match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) ?? []).map((x) => x.toLowerCase())) {
-      const r = byEmail.get(e);
-      if (!r) continue;
-      const iso = at.toISOString();
-      // The first time each was sent.
-      if (!r[step.field] || iso < r[step.field]) {
-        r[step.field] = iso;
-        stats.used++;
-        touched.add(r.id);
+    const at = readDate(row[dateKey]);
+    if (!at) continue;
+    const iso = at.toISOString();
+    const subject = String(row[subjectKey]).trim();
+    const tos = (String(row[toKey]).match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) ?? []).map((x) => x.toLowerCase());
+    if (TEAM_SUBJECTS.some((t) => subject.includes(t))) {
+      for (const e of tos) {
+        const prev = stats.team.get(e);
+        stats.team.set(e, { first: prev && prev.first < iso ? prev.first : iso, welcomed: (prev?.welcomed ?? false) || subject.startsWith("Welcome to the WorkRoute team") });
       }
-      if (step.field === "voiceRequestedAt" && !r.voiceStatus) r.voiceStatus = "Voice Assessment Requested";
-      if (step.status && !r.offerAcceptedAt && !r.offerDeclinedAt && STATUS_ORDER.includes(r.status) && STATUS_ORDER.indexOf(r.status) < STATUS_ORDER.indexOf(step.status)) r.status = step.status;
+      continue;
+    }
+    const step = EMAIL_STEPS.find((s) => subject.startsWith(s.subject));
+    for (const e of tos) {
+      const r = byEmail.get(e);
+      if (!r) {
+        unknownTo.add(e);
+        continue;
+      }
+      // An address that does not exist: say so on the candidate.
+      if (bounceKey && String(row[bounceKey]).trim()) {
+        const reason = String(row[bounceKey]).match(/Reason:\s*(.+)$/i)?.[1]?.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+/gi, "").trim().slice(0, 120) ?? "";
+        note(r, `Check: emails to ${r.email} bounce — the address does not exist${reason ? ` (${reason})` : ""}.`);
+        if (!r.__bounced) stats.bounced++;
+        r.__bounced = true;
+      }
+      if (!step) continue;
+      if (step.note) {
+        note(r, `${step.note}: ${iso.slice(0, 10)} (from the email log).`);
+      } else {
+        step.apply(r, iso);
+        if (step.voice && !r.voiceStatus) r.voiceStatus = step.voice;
+        if (step.status && !r.offerAcceptedAt && !r.offerDeclinedAt && STATUS_ORDER.includes(r.status) && STATUS_ORDER.indexOf(r.status) < STATUS_ORDER.indexOf(step.status)) {
+          r.status = step.status;
+        }
+      }
+      stats.used++;
+      touched.add(r);
     }
   }
+  for (const r of records) {
+    delete r.__live;
+    delete r.__bounced;
+    delete r.__voiceReminders;
+  }
+  for (const [r, lines] of notes) r.notes += "\n" + [...lines].sort().join("\n");
   stats.people = touched.size;
-  if (!rows.length || !stats.used) console.log(`Email log: nothing matched. Columns found: ${Object.keys(rows[0] ?? {}).join(", ") || "none"}.`);
+  stats.unknown = unknownTo.size;
   return stats;
 }
 
@@ -1666,7 +1828,7 @@ async function main() {
   writeFileSync(path.join(OUT, "candidates.json"), JSON.stringify(records, null, 2));
   if (READ_IDS) writeFileSync(path.join(OUT, "id-data.json"), JSON.stringify(idData, null, 2));
   const sealFound = await recoverSeal();
-  const teamFound = await recoverTeam(tg, records, byName, rebuiltAt);
+  const teamFound = await recoverTeam(tg, records, byName, rebuiltAt, emailStats?.team ?? new Map());
 
   const order = { high: 0, medium: 1, "from files only": 2, "no files": 3, "same person (left out)": 4, "not matched (left out)": 5 };
   report.sort((x, y) => order[x.sure] - order[y.sure] || (x.c.fullName || "~").localeCompare(y.c.fullName || "~"));
@@ -1732,7 +1894,11 @@ async function main() {
     `Agreement signature and stamp: ${sealFound.length ? `${sealFound.join(" and ")} found (recovered/agreement-seal.json)` : "none found in R2"}. ` +
       `Company details: ${companiesSet}. Team members: ${teamFound.members} in recovered/team.json (${teamFound.linked} linked to their candidate; ` +
       `${teamFound.unnamed} R2 team folders with no name, listed in team-recovery.csv).` +
-      (emailStats ? `\nEmail log: ${emailStats.rows} emails read, ${emailStats.used} dates added to ${emailStats.people} candidates.` : ""),
+      (emailStats
+        ? `\nEmail log: ${emailStats.rows} emails read; ${emailStats.used} used on ${emailStats.people} candidates; ` +
+          `${emailStats.bounced} candidates whose address bounces; ${emailStats.team.size} team members found by their portal emails; ` +
+          `${emailStats.unknown} addresses not in the list.`
+        : ""),
   );
   console.log(`Voice recordings found: ${records.filter((r) => r.voiceStatus === "Voice Recording Received").length} candidates (status set to "Voice Recording Received").`);
   const agreeN = all.filter((f) => f.idCvNames === "agree").length;
