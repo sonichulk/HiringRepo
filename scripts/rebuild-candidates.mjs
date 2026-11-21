@@ -1206,6 +1206,17 @@ async function main() {
         notes.push(`Interview score from Telegram: ${iv.score} (${iv.at.slice(0, 10)}). Answers were not recoverable.`);
       }
     }
+    // Same folder, same person: the name on their ID and the one at the top
+    // of their CV should agree. When they share no word, say so.
+    if (f?.mrz && f.cv?.name) {
+      const idName = nameKey(`${f.mrz.firstName} ${f.mrz.lastName}`);
+      const cvName = nameKey(f.cv.name);
+      const shared = idName.split(" ").filter((w) => w.length > 1 && cvName.split(" ").includes(w));
+      f.idCvNames = shared.length ? "agree" : "differ";
+      if (!shared.length) {
+        notes.push(`Check: the name on their ID (${titled(`${f.mrz.firstName} ${f.mrz.lastName}`)}) is not the name in their CV (${f.cv.name}).`);
+      }
+    }
     if (f?.mrz) {
       c.identityDocumentType = f.mrz.documentType;
       if (f.mrz.nationality) notes.push(`ID read: ${f.mrz.documentType}, nationality ${f.mrz.nationality}${f.mrz.expiryDate ? `, expires ${f.mrz.expiryDate}` : ""}${f.mrz.sure ? "" : " (not certain)"}.`);
@@ -1355,6 +1366,9 @@ async function main() {
         `Check against folders known from the "submitted" message: CV email agrees ${agree}, disagrees ${disagree}.`,
     );
   }
+  const agreeN = all.filter((f) => f.idCvNames === "agree").length;
+  const differN = all.filter((f) => f.idCvNames === "differ").length;
+  if (agreeN + differN) console.log(`Name on ID compared with name in CV: ${agreeN} agree, ${differN} differ (noted on those candidates to check).`);
   const firstMsg = [...tg.applications, ...tg.submitted].map((x) => x.at).sort()[0] ?? "";
   const beforeTelegram = withForm.filter((f) => f.lastAppUpload && f.lastAppUpload < firstMsg).length;
   if (beforeTelegram) console.log(`${beforeTelegram} folders have files from before the first Telegram message (${firstMsg.slice(0, 10)}).`);
