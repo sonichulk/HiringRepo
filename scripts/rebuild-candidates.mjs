@@ -34,6 +34,9 @@
  * Output, in recovered/ (never committed — it holds personal data):
  *   candidates.json         the rebuilt list, to put in DATA_DIR on the new server
  *   rebuild-report.csv      one line per candidate: how sure the match is, and why
+ *   agreement-seal.json     which signature and stamp images in R2 the agreements use
+ *   team.json               team members, recovered not activated: check them before activating
+ *   team-recovery.csv       one line per team member, with what was and was not recovered
  *   id-data.json            (with --ids) what was read from each ID
  */
 
@@ -58,6 +61,7 @@ const TELEGRAM = argValue("--telegram");
 const READ_IDS = args.includes("--ids");
 const READ_CVS = args.includes("--cvs");
 const INCLUDE_UNNAMED = args.includes("--include-unnamed");
+const EMAIL_LOG = argValue("--emails");
 
 if (!TELEGRAM) {
   console.log(
@@ -65,7 +69,8 @@ if (!TELEGRAM) {
       "  --telegram  the result.json from Telegram Desktop (Export chat history, format JSON)\n" +
       "  --ids       also read passports and ID cards in R2 (needs tesseract.js, see the top of this file)\n" +
       "  --cvs       also read the email addresses and phone numbers in CVs (needs pdfjs-dist and mammoth)\n" +
-      "  --include-unnamed  also add R2 folders nobody could be matched to, with no name",
+      "  --include-unnamed  also add R2 folders nobody could be matched to, with no name\n" +
+      "  --emails    a log of sent emails exported from your email service (CSV or JSON), for the dates offers, invitations and requests were sent",
   );
   process.exit(0);
 }
@@ -257,7 +262,7 @@ function readTelegram(file) {
   const chats = Array.isArray(data?.messages) ? [data] : (data?.chats?.list ?? []);
   const messages = chats.flatMap((c) => c.messages ?? []).filter((m) => m?.type === "message");
 
-  const t = { applications: [], submitted: [], interviews: [], addresses: [], signed: [], offers: [], later: 0 };
+  const t = { applications: [], submitted: [], interviews: [], addresses: [], signed: [], offers: [], companies: [], team: [], later: 0 };
   const people = []; // name + email from any later message about a candidate
   for (const m of messages) {
     const text = messageText(m);
@@ -307,6 +312,20 @@ function readTelegram(file) {
         address: f.now || f.address || "",
         onFile: f["on file"] && f["on file"] !== "—" ? f["on file"] : "",
       });
+      continue;
+    }
+    // Team portal notes: "<b>Member:</b> name", one line, then the admin link.
+    if (f.member) {
+      const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+      const id = text.match(/\/admin\/team\/([A-Za-z0-9_-]{6,})/)?.[1] ?? "";
+      t.team.push({ at, title: lines[0].replace(/^[^A-Za-z]+/, ""), name: f.member, key: nameKey(f.member), memberId: id, line: lines.find((l) => /^(Subject|Day):/.test(l)) ?? "" });
+      continue;
+    }
+    // "🏢 Company details confirmed", the name, then "Company — EIN 12-3456789".
+    if (/Company details confirmed/.test(text)) {
+      const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+      const m3 = (lines[2] ?? "").match(/^(.*?)\s*[—–-]\s*EIN\s*(.+)$/);
+      if (m3) t.companies.push({ at, name: lines[1] ?? "", key: nameKey(lines[1] ?? ""), companyName: m3[1].trim(), ein: m3[2].trim() });
       continue;
     }
     // "✅ Offer accepted" / "❌ Offer declined": the name is the line after the title.
@@ -589,6 +608,247 @@ async function idReader(count) {
   };
 }
 
+// ------------------------------------------------------------------ signature and stamp
+
+/** The newest signature and stamp images under settings/agreement/, as agreement-seal.json. */
+async function recoverSeal() {
+  const found = [];
+  const seal = {};
+  const objs = await listAll("settings/agreement/");
+  for (const kind of ["signature", "stamp"]) {
+    const o = objs.filter((x) => path.basename(x.key).startsWith(`${kind}-`)).sort((a, b) => a.at.localeCompare(b.at)).at(-1);
+    if (!o) continue;
+    let width = 0;
+    let height = 0;
+    try {
+      const sharp = (await import("sharp")).default;
+      const meta = await sharp(await getBytes(o.key)).metadata();
+      width = meta.width ?? 0;
+      height = meta.height ?? 0;
+    } catch {
+      /* the size is only used to draw it; the image is still found */
+    }
+    seal[kind] = { key: o.key, type: /\.png$/i.test(o.key) ? "image/png" : "image/jpeg", width, height, uploadedAt: o.at, by: "recovered" };
+    found.push(kind);
+  }
+  if (found.length) writeFileSync(path.join(OUT, "agreement-seal.json"), JSON.stringify(seal, null, 2));
+  return found;
+}
+
+// ------------------------------------------------------------------ team members
+
+const BANK_IDS = ["wise", "revolut", "n26", "vivid", "starling"];
+const FILE_TYPES = { ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" };
+
+/**
+ * Team members, from the team portal's Telegram notes (each names the member;
+ * activation and bank notes also carry their member id) and their R2 folders.
+ * Written not activated, so no hours are counted until someone has checked
+ * their schedule and rate — those, their professional email, password, bank
+ * details and worked hours were only on the lost volume.
+ */
+async function recoverTeam(tg, records, byName, rebuiltAt) {
+  const drafts = new Map(); // name key -> draft
+  for (const m of [...tg.team].sort((a, b) => a.at.localeCompare(b.at))) {
+    if (!m.key) continue;
+    const d = drafts.get(m.key) ?? { name: m.name, key: m.key, ids: new Set(), first: m.at, activatedAt: "", tickets: [], daysOff: [], bank: "" };
+    if (m.memberId) d.ids.add(m.memberId);
+    if (/Account activated/i.test(m.title)) d.activatedAt = d.activatedAt || m.at;
+    if (/ticket/i.test(m.title) && m.line.startsWith("Subject:")) d.tickets.push(`${m.at.slice(0, 10)} ${m.line.slice(8).trim()}`);
+    if (/Day off/i.test(m.title)) d.daysOff.push(m.line.replace(/^Day:\s*/, ""));
+    if (/Bank details/i.test(m.title)) d.bank = m.at;
+    drafts.set(m.key, d);
+  }
+
+  // Their files in R2: documents shared with them, and mail attachments.
+  const folders = new Map();
+  for (const o of [...(await listAll("team/")), ...(await listAll("team-mail/"))]) {
+    const [top, id] = o.key.split("/");
+    if (!id || id === "unknown") continue;
+    if (!folders.has(id)) folders.set(id, { docs: [], mail: 0 });
+    if (top === "team") folders.get(id).docs.push(o);
+    else folders.get(id).mail++;
+  }
+
+  const members = [];
+  const rows = [];
+  const usedIds = new Set();
+  let linked = 0;
+  const today = rebuiltAt.slice(0, 10);
+  for (const d of drafts.values()) {
+    const id = [...d.ids].find((x) => !usedIds.has(x)) ?? randomBytes(9).toString("base64url");
+    usedIds.add(id);
+    const { one: c } = byName(d.key);
+    if (c) linked++;
+    const firstWorkDay = c?.agreementStartDate || (d.activatedAt ? d.activatedAt.slice(0, 10) : today);
+    const f = folders.get(id);
+    const documents = (f?.docs ?? []).map((o) => {
+      const base = path.basename(o.key);
+      const dash = base.indexOf("-");
+      return {
+        id: dash > 0 ? base.slice(0, dash) : base,
+        key: o.key,
+        name: dash > 0 ? base.slice(dash + 1) : base,
+        type: FILE_TYPES[path.extname(base).toLowerCase()] ?? "application/octet-stream",
+        size: o.size,
+        at: o.at,
+        by: "recovered",
+      };
+    });
+    const notes = [
+      `Recovered on ${today} after the host volume was lost${c ? "" : " — no candidate of this name was found: add their email"}.`,
+      "Before activating: set their professional email, schedule, hours per day and hourly rate (all lost — shown here as defaults, rate 0).",
+      "Then press Send portal login (a new password) and ask them to add their bank details again.",
+      "Hours worked before were lost: ask them to confirm, and add them by hand.",
+      d.activatedAt ? `Their account had been activated on ${d.activatedAt.slice(0, 10)}.` : "",
+      d.tickets.length ? `Tickets they had opened (text lost): ${d.tickets.join("; ")}.` : "",
+      d.daysOff.length ? `Days off they had asked for: ${d.daysOff.join("; ")}.` : "",
+      f?.mail ? `${f.mail} mail attachments are kept in R2 under team-mail/${id}/ (the emails themselves were lost).` : "",
+    ].filter(Boolean);
+    members.push({
+      id,
+      ...(c ? { candidateId: c.id } : {}),
+      fullName: c?.fullName || d.name,
+      loginEmail: c?.email || "",
+      ...(c?.phone ? { personalPhone: c.phone } : {}),
+      ...(c?.country ? { country: c.country } : {}),
+      ...(c?.position ? { position: c.position } : {}),
+      status: "active",
+      createdAt: d.first,
+      createdBy: "recovered",
+      sessionVersion: 1,
+      schedule: { days: ["Mon", "Tue", "Wed", "Thu", "Fri"], startTime: "09:00", endTime: "17:00", timeZone: "Europe/London" },
+      hoursPerDay: 8,
+      rates: [{ from: firstWorkDay, rate: 0 }],
+      firstWorkDay,
+      checkInRequired: false,
+      allowedBanks: [...BANK_IDS],
+      ...(documents.length ? { documents } : {}),
+      notes: notes.join("\n"),
+    });
+    rows.push([d.name, id, c?.id ?? "", c?.email ?? "", d.activatedAt.slice(0, 10), firstWorkDay, d.tickets.length, documents.length + (f?.mail ?? 0), c ? "" : "no candidate of this name"]);
+  }
+  // R2 team folders nobody in Telegram is known by: listed, not added.
+  let unnamed = 0;
+  for (const [id, f] of folders) {
+    if (usedIds.has(id)) continue;
+    unnamed++;
+    rows.push(["(unknown)", id, "", "", "", "", 0, f.docs.length + f.mail, "R2 team folder with no name in Telegram: not added"]);
+  }
+
+  if (members.length) {
+    writeFileSync(
+      path.join(OUT, "team.json"),
+      JSON.stringify({ members, announcements: [], settings: {}, ticketSeq: 1000, activationMigrated: true }, null, 2),
+    );
+  }
+  writeFileSync(
+    path.join(OUT, "team-recovery.csv"),
+    [
+      "Name,Member ID,Candidate ID,Email,Was activated on,First work day,Tickets,Files in R2,Note",
+      ...rows.map((r) => r.map(cell).join(",")),
+    ].join("\r\n"),
+  );
+  return { members: members.length, linked, unnamed };
+}
+
+// ------------------------------------------------------------------ sent-email log
+
+/** Subjects of the site's own emails, and what each one marks. */
+const EMAIL_STEPS = [
+  { subject: "Complete your WorkRoute online assessment", field: "invitationSentAt", status: "Interview Invitation Sent" },
+  { subject: "Confirm your identity to continue with WorkRoute", field: "verificationRequestedAt" },
+  { subject: "Congratulations — next step: your voice assessment", field: "voiceRequestedAt" },
+  { subject: "Good news | A place is available for you at WorkRoute", field: "offerSentAt", status: "Offer Sent" },
+  { subject: "Your agreement is ready — please confirm your address", field: "addressProofRequestedAt" },
+  { subject: "Confirm your company details before we issue your WorkRoute agreement", field: "companyRequestedAt" },
+];
+const STATUS_ORDER = ["New Application", "Interview Invitation Sent", "Interview Pending", "Interview Completed", "Under Review", "Accepted", "Offer Sent"];
+
+function parseCsv(text) {
+  const firstLine = text.slice(0, text.indexOf("\n") + 1 || undefined);
+  const sep = (firstLine.match(/;/g) ?? []).length > (firstLine.match(/,/g) ?? []).length ? ";" : ",";
+  const rows = [];
+  let row = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else if (ch === '"') quoted = false;
+      else field += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === sep) {
+      row.push(field);
+      field = "";
+    } else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && text[i + 1] === "\n") i++;
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else field += ch;
+  }
+  if (field || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  const head = (rows.shift() ?? []).map((h) => h.trim().toLowerCase());
+  return rows.filter((r) => r.some((v) => v.trim())).map((r) => Object.fromEntries(head.map((h, i) => [h, r[i] ?? ""])));
+}
+
+/** A log of sent emails (CSV or JSON, as exported): dates of invitations, offers and requests. */
+function readEmailLog(file, records) {
+  if (!file) return null;
+  if (!existsSync(file)) {
+    console.error(`Email log not found: ${file}`);
+    return null;
+  }
+  const text = readFileSync(file, "utf8").replace(/^﻿/, "");
+  let rows;
+  try {
+    const data = JSON.parse(text);
+    rows = (Array.isArray(data) ? data : (data.data ?? data.emails ?? data.messages ?? [])).map((o) =>
+      Object.fromEntries(Object.entries(o).map(([k, v]) => [k.toLowerCase(), typeof v === "string" ? v : Array.isArray(v) ? v.join(",") : JSON.stringify(v ?? "")])),
+    );
+  } catch {
+    rows = parseCsv(text);
+  }
+  const col = (row, re) => Object.keys(row).find((k) => re.test(k));
+  const byEmail = new Map(records.filter((r) => r.email).map((r) => [r.email.toLowerCase(), r]));
+  const stats = { rows: rows.length, used: 0, people: 0 };
+  const touched = new Set();
+  for (const row of rows) {
+    const toKey = col(row, /^(to|recipient|recipients|to_address|to address|toaddress|to_email|to email|email|email address|destination)$/);
+    const subjectKey = col(row, /subject/);
+    const dateKey = col(row, /^(date|sent|sent at|sent_at|created|created at|created_at|timestamp|time|processed|delivered)/);
+    if (!toKey || !subjectKey || !dateKey) continue;
+    const at = new Date(row[dateKey]);
+    if (Number.isNaN(at.getTime())) continue;
+    const step = EMAIL_STEPS.find((s) => row[subjectKey].trim().startsWith(s.subject));
+    if (!step) continue;
+    for (const e of (row[toKey].match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) ?? []).map((x) => x.toLowerCase())) {
+      const r = byEmail.get(e);
+      if (!r) continue;
+      const iso = at.toISOString();
+      // The first time each was sent.
+      if (!r[step.field] || iso < r[step.field]) {
+        r[step.field] = iso;
+        stats.used++;
+        touched.add(r.id);
+      }
+      if (step.field === "voiceRequestedAt" && !r.voiceStatus) r.voiceStatus = "Voice Assessment Requested";
+      if (step.status && !r.offerAcceptedAt && !r.offerDeclinedAt && STATUS_ORDER.includes(r.status) && STATUS_ORDER.indexOf(r.status) < STATUS_ORDER.indexOf(step.status)) r.status = step.status;
+    }
+  }
+  stats.people = touched.size;
+  if (!rows.length || !stats.used) console.log(`Email log: nothing matched. Columns found: ${Object.keys(rows[0] ?? {}).join(", ") || "none"}.`);
+  return stats;
+}
+
 // ------------------------------------------------------------------ main
 
 const DOCUMENT_KINDS = new Set([
@@ -606,7 +866,8 @@ async function main() {
     `Telegram: ${tg.applications.length - tg.later} applications (+${tg.later} people known only from later messages), ` +
       `${tg.submitted.length} "submitted" messages, ${tg.interviews.length} interviews, ` +
       `${tg.offers.filter((o) => o.accepted).length} offers accepted, ${tg.offers.filter((o) => !o.accepted).length} declined, ` +
-      `${tg.addresses.length} proofs of address, ${tg.signed.length} signed agreements.`,
+      `${tg.addresses.length} proofs of address, ${tg.signed.length} signed agreements, ` +
+      `${tg.companies.length} company details, ${tg.team.length} team portal messages.`,
   );
   if (!tg.applications.length) {
     console.error("No application messages found. Is this the export of the chat your bot posts to?");
@@ -1375,9 +1636,37 @@ async function main() {
     }
   }
 
+  /** The one candidate of this name who had got furthest; none when several tie. */
+  const byName = (key, before) => {
+    const same = records.filter((r) => r.fullName && sameName(nameKey(r.fullName), key) && (!before || (r.createdAt || "") <= before));
+    if (!same.length) return { one: null, same };
+    const best = Math.max(...same.map(stage));
+    const top = same.filter((r) => stage(r) === best);
+    return { one: top.length === 1 ? top[0] : null, same };
+  };
+
+  // US company details (only the company name and EIN were in the message).
+  let companiesSet = 0;
+  for (const co of tg.companies) {
+    const { one, same } = byName(co.key, co.at);
+    if (!one) {
+      for (const r of same) r.notes += `\nCheck: a "Company details confirmed" message (${co.companyName}) has this name, but several candidates share it.`;
+      continue;
+    }
+    one.companyDetails = { companyName: co.companyName, companyNumber: "", ein: co.ein, street: "", city: "", state: "", zip: "" };
+    one.companyDetailsAt = co.at;
+    one.notes += `\nCompany details from Telegram: ${co.companyName}, EIN ${co.ein}. The company address was not recoverable.`;
+    companiesSet++;
+  }
+
+  // Sent emails, from the email service's own log: when each step was sent.
+  const emailStats = readEmailLog(EMAIL_LOG, records);
+
   records.sort((x, y) => (y.createdAt || "").localeCompare(x.createdAt || ""));
   writeFileSync(path.join(OUT, "candidates.json"), JSON.stringify(records, null, 2));
   if (READ_IDS) writeFileSync(path.join(OUT, "id-data.json"), JSON.stringify(idData, null, 2));
+  const sealFound = await recoverSeal();
+  const teamFound = await recoverTeam(tg, records, byName, rebuiltAt);
 
   const order = { high: 0, medium: 1, "from files only": 2, "no files": 3, "same person (left out)": 4, "not matched (left out)": 5 };
   report.sort((x, y) => order[x.sure] - order[y.sure] || (x.c.fullName || "~").localeCompare(y.c.fullName || "~"));
@@ -1438,6 +1727,12 @@ async function main() {
     `Application form submitted: ${records.filter((r) => r.submittedAt).length}; interview completed with score: ${records.filter((r) => r.interview).length}; ` +
       `offers accepted: ${records.filter((r) => r.offerAcceptedAt && r.notes.includes("Offer accepted")).length}, declined: ${records.filter((r) => r.offerDeclinedAt).length} ` +
       `(${offerStats.unsure} offer messages with a name shared by several candidates, ${offerStats.none} with no candidate of that name).`,
+  );
+  console.log(
+    `Agreement signature and stamp: ${sealFound.length ? `${sealFound.join(" and ")} found (recovered/agreement-seal.json)` : "none found in R2"}. ` +
+      `Company details: ${companiesSet}. Team members: ${teamFound.members} in recovered/team.json (${teamFound.linked} linked to their candidate; ` +
+      `${teamFound.unnamed} R2 team folders with no name, listed in team-recovery.csv).` +
+      (emailStats ? `\nEmail log: ${emailStats.rows} emails read, ${emailStats.used} dates added to ${emailStats.people} candidates.` : ""),
   );
   console.log(`Voice recordings found: ${records.filter((r) => r.voiceStatus === "Voice Recording Received").length} candidates (status set to "Voice Recording Received").`);
   const agreeN = all.filter((f) => f.idCvNames === "agree").length;
