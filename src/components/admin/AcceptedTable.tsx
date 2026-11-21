@@ -177,7 +177,7 @@ export function AcceptedTable({
       if (chatSent === "notStarted" && (!c.chatLinkSentAt || c.chatStarted)) return false;
       if (addressProof !== "all" && (c.addressProofStatus ?? "not_asked") !== addressProof) return false;
       if (agreement !== "all" && (c.agreementStatus ?? "not_sent") !== agreement) return false;
-      if (!matchesIdTypeFilter(idType, c.identityDocumentType)) return false;
+      if (!matchesIdTypeFilter(idType, c.identityDocumentType, c.identityDetectedType)) return false;
       if (!matchesFollowupFilter(followup, c.followupState)) return false;
       return true;
     });

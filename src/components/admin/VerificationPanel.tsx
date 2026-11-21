@@ -18,7 +18,7 @@ import {
   notAskedYet,
   type VerificationStatus,
 } from "@/lib/verification";
-import { ID_DOCUMENT_LABEL, type IdDocumentType } from "@/lib/identityDocuments";
+import { ID_DOCUMENT_LABEL, ID_SCAN_LABEL, type IdDocumentType, type IdScanType } from "@/lib/identityDocuments";
 import { LiveVerificationButton } from "@/components/admin/LiveVerificationButton";
 import type { LiveVerificationState } from "@/lib/liveVerification";
 
@@ -232,6 +232,7 @@ export function VerificationPanel({
   initial,
   live,
   offerAcceptedAt,
+  detectedType,
   onLiveChange,
   onChange,
 }: {
@@ -246,6 +247,8 @@ export function VerificationPanel({
   /** Passed through to the live check, which questions "before the agreement"
       wording for somebody who has not been offered anything. */
   offerAcceptedAt?: string;
+  /** What the photo was read as (admin only; can be Aadhaar or PAN). */
+  detectedType?: IdScanType;
   onLiveChange?: (state: LiveVerificationState) => void;
   /**
    * Report the new state upward. Without this the row behind the profile keeps
@@ -433,9 +436,14 @@ export function VerificationPanel({
         <p className="mt-2 text-xs text-navy-500">
           Document sent: <strong className="text-navy-700">{ID_DOCUMENT_LABEL[state.documentType]}</strong>
         </p>
-      ) : images.length ? (
+      ) : images.length && !detectedType ? (
         <p className="mt-2 text-xs text-navy-400">
           Document type not recorded — sent before we started asking which it was.
+        </p>
+      ) : null}
+      {detectedType && detectedType !== state.documentType ? (
+        <p className="mt-1 text-xs text-navy-500" data-id-detected={detectedType}>
+          Read from the photo: <strong className="text-navy-700">{ID_SCAN_LABEL[detectedType]}</strong>
         </p>
       ) : null}
 

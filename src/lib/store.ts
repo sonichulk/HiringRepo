@@ -30,7 +30,7 @@ import {
   type CandidateDocument,
   type DocumentKind,
 } from "@/lib/documents";
-import { needsBack, type IdDocumentType } from "@/lib/identityDocuments";
+import { needsBack, type IdDocumentType, type IdScanType } from "@/lib/identityDocuments";
 import { isVerificationKind } from "@/lib/verification";
 import { isResidenceKind } from "@/lib/residence";
 
@@ -253,6 +253,13 @@ export interface Candidate {
    * selfie, document unknown", which is exactly what those records hold.
    */
   identityDocumentType?: IdDocumentType;
+  /**
+   * What the ID photo was read as (scripts/scan-id-types.mjs), when it was
+   * read. Admin only, and kept apart from identityDocumentType, which is what
+   * the candidate said: this one can also be an Aadhaar or a PAN card.
+   */
+  identityDetectedType?: IdScanType;
+  identityDetectedAt?: string;
   /**
    * When a recruiter last asked for the photographs to be taken again, and the
    * reason the candidate is shown. Kept as a timestamp rather than a flag so

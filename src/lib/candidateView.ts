@@ -16,7 +16,7 @@ import {
   verificationStatus,
   type VerificationStatus,
 } from "@/lib/verification";
-import type { IdDocumentType } from "@/lib/identityDocuments";
+import type { IdDocumentType, IdScanType } from "@/lib/identityDocuments";
 import { voiceRecordingNeeded } from "@/lib/voice";
 import type { Offer } from "@/lib/offer";
 // Whether the deadline has *passed* is deliberately not derived here: it turns
@@ -97,6 +97,8 @@ export interface CandidateView {
   verificationRequestedAt?: string;
   /** Which of the three documents they sent. Absent for older uploads. */
   identityDocumentType?: IdDocumentType;
+  /** What the photo was read as — admin only, can be Aadhaar or PAN too. */
+  identityDetectedType?: IdScanType;
   identityReuploadRequestedAt?: string;
   identityReuploadReason?: string;
   /**
@@ -368,6 +370,7 @@ export function toCandidateView(
     verificationConsentAt: c.verificationConsentAt,
     verificationRequestedAt: c.verificationRequestedAt,
     identityDocumentType: c.identityDocumentType,
+    identityDetectedType: c.identityDetectedType,
     identityReuploadRequestedAt: c.identityReuploadRequestedAt,
     identityReuploadReason: c.identityReuploadReason,
     favorite: c.favorite,

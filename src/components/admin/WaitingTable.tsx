@@ -29,6 +29,7 @@ import { adminPost } from "@/lib/adminClient";
 import { daysWaiting, WAITING_TOO_LONG_DAYS, waitingSince } from "@/lib/voiceAck";
 import {
   ID_DOCUMENT_LABEL,
+  ID_SCAN_LABEL,
   ID_TYPE_FILTERS,
   matchesIdTypeFilter,
   type IdTypeFilter,
@@ -114,7 +115,7 @@ export function WaitingTable({ rows }: { rows: CandidateView[] }) {
         return false;
       }
       if (country !== "all" && c.country !== country) return false;
-      if (!matchesIdTypeFilter(idType, c.identityDocumentType)) return false;
+      if (!matchesIdTypeFilter(idType, c.identityDocumentType, c.identityDetectedType)) return false;
       return true;
     });
   }, [live, search, country, hiddenCountries, idType]);
@@ -411,6 +412,10 @@ export function WaitingTable({ rows }: { rows: CandidateView[] }) {
                       {c.identityDocumentType ? (
                         <p className="mt-0.5 text-xs text-navy-500">
                           {ID_DOCUMENT_LABEL[c.identityDocumentType]}
+                        </p>
+                      ) : c.identityDetectedType ? (
+                        <p className="mt-0.5 text-xs text-navy-500" title="Read from the photo">
+                          {ID_SCAN_LABEL[c.identityDetectedType]} (read from photo)
                         </p>
                       ) : null}
                     </td>

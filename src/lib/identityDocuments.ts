@@ -45,18 +45,39 @@ export const ID_DOCUMENT_HINT: Record<IdDocumentType, string> = {
  * nothing saying which document they are of. Both show a dash, and asking for
  * the dash has to return them.
  */
-export type IdTypeFilter = "all" | IdDocumentType | "none";
+/**
+ * What an ID photo turned out to be, read from the photo itself
+ * (scripts/scan-id-types.mjs). Admin only: candidates choose from
+ * ID_DOCUMENT_TYPES and are never offered these extra two — the site does not
+ * ask for an Aadhaar card. They exist so a recruiter can see, and filter, who
+ * sent one anyway.
+ */
+export const ID_SCAN_TYPES = ["passport", "national-id", "drivers-licence", "aadhaar", "pan"] as const;
+export type IdScanType = (typeof ID_SCAN_TYPES)[number];
+
+export function isIdScanType(v: unknown): v is IdScanType {
+  return typeof v === "string" && (ID_SCAN_TYPES as readonly string[]).includes(v);
+}
+
+export const ID_SCAN_LABEL: Record<IdScanType, string> = {
+  ...ID_DOCUMENT_LABEL,
+  aadhaar: "Aadhaar card",
+  pan: "PAN card",
+};
+
+export type IdTypeFilter = "all" | IdScanType | "none";
 
 export const ID_TYPE_FILTERS: { value: IdTypeFilter; label: string }[] = [
   { value: "all", label: "Any document" },
-  ...ID_DOCUMENT_TYPES.map((t) => ({ value: t as IdTypeFilter, label: ID_DOCUMENT_LABEL[t] })),
+  ...ID_SCAN_TYPES.map((t) => ({ value: t as IdTypeFilter, label: ID_SCAN_LABEL[t] })),
   { value: "none", label: "Not recorded" },
 ];
 
-export function matchesIdTypeFilter(filter: IdTypeFilter, type?: string): boolean {
+/** By what they said they sent, or by what the photo was read as. */
+export function matchesIdTypeFilter(filter: IdTypeFilter, type?: string, readAs?: string): boolean {
   if (filter === "all") return true;
-  if (filter === "none") return !type;
-  return type === filter;
+  if (filter === "none") return !type && !readAs;
+  return type === filter || readAs === filter;
 }
 
 /**

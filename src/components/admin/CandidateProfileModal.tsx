@@ -601,6 +601,7 @@ export function CandidateProfileModal({
             initial={verification}
             live={liveStateOf(candidate)}
             offerAcceptedAt={candidate.offerAcceptedAt}
+            detectedType={candidate.identityDetectedType}
             onLiveChange={(live) => onChange(live)}
             onChange={(v) =>
               onChange(verificationPatch(v))
